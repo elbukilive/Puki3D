@@ -1,9 +1,12 @@
 """Workspace selection and inspector synchronization tests."""
 
 import os
+import copy
 import tempfile
 import unittest
 from pathlib import Path
+
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -12,6 +15,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from puki3d.project import Project
+from puki3d.scene import node_matrix
 from puki3d.ui import MainWindow
 
 
@@ -48,6 +52,171 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.window.viewport.select_node(None)
         self.assertEqual(self.window.outliner.currentRow(), -1)
         self.assertFalse(self.window.transform_panel.isEnabled())
+
+    def test_edit_mode_extrudes_and_undo_redo_persists_mesh(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        viewport.set_mode("edit")
+        viewport.selected_components = {1}
+        original = copy.deepcopy(node["geometry"])
+        screen = viewport._project([0.0, 0.0, 1.0])
+        viewport._last_mouse = QPoint(round(screen[0]), round(screen[1]))
+        viewport.extrude_selected_face()
+        self.assertTrue(viewport.extruding)
+        viewport._update_extrusion(viewport._last_mouse + QPoint(0, -70))
+        self.assertGreater(viewport._extrusion["distance"], 0.0)
+        viewport._finish_extrusion()
+        self.assertFalse(viewport.extruding)
+
+        self.assertEqual(len(node["geometry"]["vertices"]), 12)
+        self.assertEqual(len(node["geometry"]["faces"]), 10)
+        self.assertNotEqual(node["geometry"], original)
+        viewport.undo_edit()
+        self.assertEqual(node["geometry"], original)
+        viewport.redo_edit()
+        self.assertEqual(len(node["geometry"]["vertices"]), 12)
+
+        self.window.save_project()
+        reopened = Project.load(self.project.path)
+        saved_node = reopened.data["scenes"][0]["nodes"][0]
+        self.assertEqual(saved_node["geometry"], node["geometry"])
+
+    def test_escape_cancels_active_extrusion_without_changing_mesh(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        viewport.set_mode("edit")
+        viewport.selected_components = {1}
+        original = copy.deepcopy(node["geometry"])
+        screen = viewport._project([0.0, 0.0, 1.0])
+        viewport._last_mouse = QPoint(round(screen[0]), round(screen[1]))
+        viewport.extrude_selected_face()
+        viewport._update_extrusion(viewport._last_mouse + QPoint(0, -50))
+        viewport._cancel_extrusion()
+        self.assertFalse(viewport.extruding)
+        self.assertEqual(node["geometry"], original)
+        self.assertFalse(viewport._undo_stack)
+
+    def test_edit_face_picking_uses_the_face_under_the_cursor(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        viewport.set_mode("edit")
+        viewport.set_component_mode("face")
+        screen = viewport._project([0.0, 0.0, 1.0])
+        picked = viewport._pick_component(QPoint(round(screen[0]), round(screen[1])))
+        self.assertEqual(picked, 1)
+
+    def test_vertex_edge_and_face_picking_use_visible_mesh_elements(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        viewport.set_mode("edit")
+
+        viewport.set_component_mode("vertex")
+        point = node_matrix(node) @ np.append(node["geometry"]["vertices"][4], 1.0)
+        screen = viewport._project(point[:3])
+        self.assertEqual(viewport._pick_component(QPoint(round(screen[0]), round(screen[1]))), 4)
+
+        viewport.set_component_mode("edge")
+        edges = viewport._component_edges(node["geometry"])
+        edge_id = edges.index((4, 5))
+        midpoint = (np.asarray(node["geometry"]["vertices"][4]) + np.asarray(node["geometry"]["vertices"][5])) / 2
+        point = node_matrix(node) @ np.append(midpoint, 1.0)
+        screen = viewport._project(point[:3])
+        self.assertEqual(viewport._pick_component(QPoint(round(screen[0]), round(screen[1]))), edge_id)
+
+        viewport.set_component_mode("face")
+        screen = viewport._project([0.0, 0.0, 1.0])
+        self.assertEqual(viewport._pick_component(QPoint(round(screen[0]), round(screen[1]))), 1)
+
+    def test_component_move_and_scale_can_target_each_xyz_axis(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        viewport.set_mode("edit")
+        viewport.set_component_mode("vertex")
+        viewport.selected_components = set(range(8))
+
+        for tool in ("move", "scale"):
+            viewport.set_tool(tool)
+            for axis_index in range(3):
+                before = copy.deepcopy(node["geometry"])
+                viewport._drag_geometry_before = before
+                viewport._drag_geometry = copy.deepcopy(before)
+                viewport._drag_pivot_world = viewport._component_pivot(node)
+                viewport._drag_axis = axis_index
+                viewport._drag_axis_start = None
+                viewport._drag_start = QPoint(100, 100)
+                viewport._apply_component_transform(QPoint(200, 100))
+                moved_axis = [
+                    index for index in range(3)
+                    if node["geometry"]["vertices"][0][index] != before["vertices"][0][index]
+                ]
+                self.assertEqual(moved_axis, [axis_index])
+                viewport._record_geometry_change(before)
+                viewport.undo_edit()
+                self.assertEqual(node["geometry"], before)
+
+    def test_component_rotation_can_target_each_xyz_axis(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        viewport.set_mode("edit")
+        viewport.set_component_mode("vertex")
+        viewport.selected_components = set(range(8))
+        viewport.set_tool("rotate")
+        vectors = (
+            (np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+            (np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+            (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])),
+        )
+
+        for axis_index, (start_vector, end_vector) in enumerate(vectors):
+            before = copy.deepcopy(node["geometry"])
+            pivot = viewport._component_pivot(node)
+            start_screen = viewport._project(pivot + start_vector)
+            end_screen = viewport._project(pivot + end_vector)
+            start_point = QPoint(round(start_screen[0]), round(start_screen[1]))
+            end_point = QPoint(round(end_screen[0]), round(end_screen[1]))
+            viewport._drag_geometry_before = before
+            viewport._drag_geometry = copy.deepcopy(before)
+            viewport._drag_pivot_world = pivot
+            viewport._drag_axis = axis_index
+            viewport._drag_rotation_start = viewport._ray_plane_vector(start_point, pivot, viewport._axis_vector(axis_index))
+
+            viewport._apply_component_transform(end_point)
+            self.assertAlmostEqual(
+                node["geometry"]["vertices"][0][axis_index],
+                before["vertices"][0][axis_index],
+                places=6,
+            )
+            self.assertNotEqual(node["geometry"], before)
+            viewport._record_geometry_change(before)
+            viewport.undo_edit()
+            self.assertEqual(node["geometry"], before)
+
+    def test_edit_gizmo_moves_selected_vertex_and_undoes(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        viewport.set_mode("edit")
+        viewport.set_component_mode("vertex")
+        viewport.selected_components = {4}
+        viewport.set_tool("move")
+        before = viewport._snapshot_geometry()
+        viewport._drag_geometry_before = before
+        viewport._drag_geometry = copy.deepcopy(node["geometry"])
+        viewport._drag_pivot_world = viewport._component_pivot(node)
+        viewport._drag_axis = 0
+        viewport._drag_axis_start = None
+        viewport._drag_start = QPoint(100, 100)
+
+        viewport._apply_component_transform(QPoint(200, 100))
+        viewport._record_geometry_change(before)
+        self.assertEqual(node["geometry"]["vertices"][4][0], 0.5)
+        viewport.undo_edit()
+        self.assertEqual(node["geometry"]["vertices"][4][0], -0.5)
 
     def test_axis_drag_is_independent_starts_without_jump_and_can_be_cancelled(self) -> None:
         self.window.add_primitive("cube")

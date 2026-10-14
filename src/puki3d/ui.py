@@ -342,6 +342,39 @@ class MainWindow(QMainWindow):
         view_label = QLabel("VISTA DE ESCENA")
         view_label.setObjectName("eyebrow")
         canvas_toolbar.addWidget(view_label)
+        self.mode_buttons = {}
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        for mode, label in (("object", "Objeto"), ("edit", "Edición")):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setObjectName("modeActive" if mode == "object" else "toolButton")
+            button.setChecked(mode == "object")
+            self.mode_group.addButton(button)
+            button.clicked.connect(lambda checked=False, value=mode: self.viewport.set_mode(value))
+            self.mode_buttons[mode] = button
+            canvas_toolbar.addWidget(button)
+        self.component_buttons = {}
+        self.component_group = QButtonGroup(self)
+        self.component_group.setExclusive(True)
+        for mode, label in (("vertex", "V"), ("edge", "A"), ("face", "C")):
+            button = QPushButton(label)
+            button.setToolTip({"vertex": "Vértices (1)", "edge": "Aristas (2)", "face": "Caras (3)"}[mode])
+            button.setCheckable(True)
+            button.setChecked(mode == "face")
+            button.setEnabled(False)
+            self.component_group.addButton(button)
+            button.clicked.connect(lambda checked=False, value=mode: self.viewport.set_component_mode(value))
+            self.component_buttons[mode] = button
+            canvas_toolbar.addWidget(button)
+        undo_button = QPushButton("↶")
+        undo_button.setToolTip("Deshacer edición (Ctrl+Z)")
+        undo_button.clicked.connect(lambda: self.viewport.undo_edit())
+        canvas_toolbar.addWidget(undo_button)
+        redo_button = QPushButton("↷")
+        redo_button.setToolTip("Rehacer edición (Ctrl+Y)")
+        redo_button.clicked.connect(lambda: self.viewport.redo_edit())
+        canvas_toolbar.addWidget(redo_button)
         canvas_toolbar.addStretch()
         view_mode = QLabel("Perspectiva  ·  3D")
         view_mode.setObjectName("muted")
@@ -351,14 +384,18 @@ class MainWindow(QMainWindow):
         self.viewport.selectionChanged.connect(self._on_viewport_selection)
         self.viewport.transformChanged.connect(self._on_viewport_transform)
         self.viewport.sceneChanged.connect(self._mark_project_dirty)
+        self.viewport.modeChanged.connect(self._on_viewport_mode_changed)
+        self.viewport.extrusionStateChanged.connect(self._on_extrusion_state_changed)
         canvas_layout.addWidget(self.viewport, 1)
         status = QHBoxLayout()
         status_label = QLabel("ESCENA PRINCIPAL")
+        self.edit_status = status_label
         status_label.setObjectName("eyebrow")
         status.addWidget(status_label)
         status.addStretch()
         status.addWidget(QLabel("Unidades: metros"))
         canvas_layout.addLayout(status)
+        self._on_viewport_mode_changed(self.viewport.mode, self.viewport.component_mode)
         body.addWidget(canvas_area, 1)
 
         inspector = QFrame()
@@ -459,14 +496,46 @@ class MainWindow(QMainWindow):
         for tool, shortcut in (("move", "W"), ("rotate", "E"), ("scale", "R"), ("select", "Q")):
             action = QShortcut(shortcut, self.viewport)
             action.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            action.activated.connect(lambda current=tool: self._set_tool(current))
+            action.activated.connect(lambda current=tool: self._activate_tool_shortcut(current))
         delete_shortcut = QShortcut("Delete", self.viewport)
         delete_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         delete_shortcut.activated.connect(self.delete_selected)
         duplicate_shortcut = QShortcut("Ctrl+D", self.viewport)
         duplicate_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         duplicate_shortcut.activated.connect(self.duplicate_selected)
+        undo_shortcut = QShortcut("Ctrl+Z", self.viewport)
+        undo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        undo_shortcut.activated.connect(self.viewport.undo_edit)
+        redo_shortcut = QShortcut("Ctrl+Y", self.viewport)
+        redo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        redo_shortcut.activated.connect(self.viewport.redo_edit)
+        redo_shift_shortcut = QShortcut("Ctrl+Shift+Z", self.viewport)
+        redo_shift_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        redo_shift_shortcut.activated.connect(self.viewport.redo_edit)
         return root
+
+    def _activate_tool_shortcut(self, tool: str) -> None:
+        if tool == "rotate" and self.viewport.mode == "edit":
+            self.viewport.extrude_selected_face()
+        else:
+            self._set_tool(tool)
+
+    def _on_viewport_mode_changed(self, mode: str, component: str) -> None:
+        for value, button in self.mode_buttons.items():
+            button.setChecked(value == mode)
+            button.setObjectName("modeActive" if value == mode else "toolButton")
+            button.style().unpolish(button)
+            button.style().polish(button)
+        for value, button in self.component_buttons.items():
+            button.setChecked(value == component)
+            button.setEnabled(mode == "edit")
+        if self.viewport.extruding:
+            self.edit_status.setText("EXTRUSIÓN · Mueve el cursor y haz clic o Enter para confirmar · Esc cancela")
+        else:
+            self.edit_status.setText("MODO EDICIÓN · " + {"vertex": "VÉRTICES", "edge": "ARISTAS", "face": "CARAS"}[component] if mode == "edit" else "ESCENA PRINCIPAL")
+
+    def _on_extrusion_state_changed(self, active: bool) -> None:
+        self._on_viewport_mode_changed(self.viewport.mode, self.viewport.component_mode)
 
     def _add_primitive_actions(self, menu: QMenu) -> None:
         for primitive, label in PRIMITIVES.items():
@@ -571,6 +640,9 @@ class MainWindow(QMainWindow):
         self._mark_project_dirty()
 
     def delete_selected(self) -> None:
+        if self.viewport.mode == "edit":
+            self.viewport.delete_selected_components()
+            return
         selected = self.viewport.selected_node
         if not self.project or not selected:
             return

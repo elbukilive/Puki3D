@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 from puki3d.project import Project
-from puki3d.scene import PRIMITIVES, create_node, node_matrix, primitive_geometry, raycast
+from puki3d.scene import PRIMITIVES, _geometry, create_node, ensure_editable_geometry, node_matrix, primitive_geometry, raycast
 
 
 class SceneTests(unittest.TestCase):
@@ -67,6 +67,25 @@ class SceneTests(unittest.TestCase):
             self.assertEqual(loaded["primitive"], "sphere")
             self.assertEqual(loaded["geometry"], node["geometry"])
             self.assertEqual(loaded["transform"], node["transform"])
+
+    def test_legacy_triangle_geometry_is_upgraded_to_editable_faces(self) -> None:
+        geometry = {"vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "triangles": [[0, 1, 2]]}
+        ensure_editable_geometry(geometry)
+        self.assertEqual(geometry["faces"], [[0, 1, 2]])
+        self.assertEqual(geometry["triangles"], [[0, 1, 2]])
+
+    def test_concave_face_triangulation_preserves_polygon_area(self) -> None:
+        vertices = [[0, 0, 0], [2, 0, 0], [2, 2, 0], [1, 1, 0], [0, 2, 0]]
+        geometry = _geometry(vertices, [[0, 1, 2, 3, 4]])
+        triangle_area = sum(
+            np.linalg.norm(np.cross(
+                np.asarray(vertices[triangle[1]]) - vertices[triangle[0]],
+                np.asarray(vertices[triangle[2]]) - vertices[triangle[0]],
+            )) / 2
+            for triangle in geometry["triangles"]
+        )
+        self.assertEqual(len(geometry["triangles"]), 3)
+        self.assertAlmostEqual(triangle_area, 3.0)
 
 
 if __name__ == "__main__":

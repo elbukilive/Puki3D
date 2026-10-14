@@ -70,11 +70,78 @@ def primitive_geometry(primitive: str) -> dict:
 
 
 def _mesh(vertices: list, faces: list[tuple]) -> dict:
+    faces = [list(face) for face in faces]
+    return _geometry(vertices, faces)
+
+
+def _geometry(vertices: list, faces: list[list[int]]) -> dict:
+    """Build editable polygon topology and its render/picking triangulation."""
     triangles = []
     for face in faces:
-        for index in range(1, len(face) - 1):
-            triangles.append([face[0], face[index], face[index + 1]])
-    return {"vertices": vertices, "triangles": triangles}
+        triangles.extend(_triangulate_face(vertices, face))
+    return {"vertices": vertices, "faces": faces, "triangles": triangles}
+
+
+def _triangulate_face(vertices: list, face: list[int]) -> list[list[int]]:
+    """Triangulate a simple polygon using ear clipping after dominant-axis projection."""
+    if len(face) <= 3:
+        return [list(face)] if len(face) == 3 else []
+    points = [np.asarray(vertices[index], dtype=float) for index in face]
+    normal = np.zeros(3, dtype=float)
+    for current, following in zip(points, points[1:] + points[:1]):
+        normal += np.cross(current, following)
+    dominant_axis = int(np.argmax(np.abs(normal)))
+    projected = np.delete(np.asarray(points), dominant_axis, axis=1)
+    area = sum(
+        projected[i, 0] * projected[(i + 1) % len(face), 1]
+        - projected[(i + 1) % len(face), 0] * projected[i, 1]
+        for i in range(len(face))
+    )
+    if abs(area) < 1e-10:
+        return [[face[0], face[index], face[index + 1]] for index in range(1, len(face) - 1)]
+    orientation = 1.0 if area > 0 else -1.0
+    remaining = list(range(len(face)))
+    triangles = []
+
+    def cross2(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+        return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+    def inside_triangle(point: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> bool:
+        return all(orientation * value >= -1e-10 for value in (
+            cross2(a, b, point), cross2(b, c, point), cross2(c, a, point)
+        ))
+
+    while len(remaining) > 3:
+        ear_found = False
+        for offset, current in enumerate(remaining):
+            previous = remaining[offset - 1]
+            following = remaining[(offset + 1) % len(remaining)]
+            a, b, c = projected[[previous, current, following]]
+            if orientation * cross2(a, b, c) <= 1e-10:
+                continue
+            if any(
+                inside_triangle(projected[index], a, b, c)
+                for index in remaining
+                if index not in {previous, current, following}
+            ):
+                continue
+            triangles.append([face[previous], face[current], face[following]])
+            remaining.pop(offset)
+            ear_found = True
+            break
+        if not ear_found:
+            # Keep malformed/degenerate legacy polygons renderable.
+            return [[face[0], face[index], face[index + 1]] for index in range(1, len(face) - 1)]
+    triangles.append([face[index] for index in remaining])
+    return triangles
+
+
+def ensure_editable_geometry(geometry: dict) -> dict:
+    """Upgrade legacy triangle-only geometry in place without changing its shape."""
+    if not geometry.get("faces"):
+        geometry["faces"] = [list(triangle) for triangle in geometry.get("triangles", [])]
+    geometry.update(_geometry(geometry.get("vertices", []), geometry["faces"]))
+    return geometry
 
 
 def create_node(primitive: str, index: int = 1) -> dict:
