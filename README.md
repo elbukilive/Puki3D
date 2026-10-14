@@ -1,6 +1,6 @@
 ﻿# Puki3D
 
-Aplicación de escritorio para organizar proyectos de vehículos, accesorios y objetos 3D. La etapa PROJECT incluye creación y apertura de proyectos, guardado en formato propio y un workspace preparado para futuras escenas y herramientas.
+Aplicación de escritorio para crear proyectos y modelar objetos 3D. Incluye gestión de proyectos `.puki3d`, un viewport OpenGL con primitivas, selección, transformaciones, outliner e inspector, y guardado de escenas editable.
 
 ## Requisitos
 

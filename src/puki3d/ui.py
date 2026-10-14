@@ -1,18 +1,21 @@
-"""PySide6 desktop interface for the PROJECT stage."""
+"""PySide6 desktop interface for the PROJECT and MODEL stages."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QStandardPaths, QSize
-from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen
+from PySide6.QtCore import Qt, QStandardPaths, QSignalBlocker, QTimer
+from PySide6.QtGui import QAction, QColor, QShortcut, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
+    QDoubleSpinBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -20,13 +23,17 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPushButton,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from .project import PROJECT_EXTENSION, PROJECT_TYPES, Project, ProjectError
+from .scene import PRIMITIVES, create_node
+from .viewport import SceneViewport
 
 
 BACKGROUND = "#101114"
@@ -83,57 +90,6 @@ class CreateProjectDialog(QDialog):
         layout.addSpacing(8)
         layout.addWidget(buttons)
         self.name.setFocus()
-
-
-class ViewportPlaceholder(QWidget):
-    """Quiet, purpose-built viewport canvas; it does not create 3D geometry."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setMinimumSize(400, 300)
-        self.setObjectName("viewport")
-
-    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt event API
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#121419"))
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        center_x = self.width() * 0.5
-        center_y = self.height() * 0.57
-        # A subtle perspective floor gives the future viewport a clear canvas identity.
-        pen = QPen(QColor("#252932"), 1)
-        painter.setPen(pen)
-        horizon = self.height() * 0.48
-        floor_bottom = self.height() * 0.91
-        for index in range(-12, 13):
-            x_bottom = center_x + index * self.width() * 0.06
-            painter.drawLine(int(center_x), int(horizon), int(x_bottom), int(floor_bottom))
-        for fraction in (0.05, 0.11, 0.19, 0.30, 0.43, 0.58, 0.76, 1.0):
-            y = horizon + (floor_bottom - horizon) * fraction
-            painter.drawLine(int(self.width() * 0.18), int(y), int(self.width() * 0.82), int(y))
-        painter.setPen(QPen(QColor("#343944"), 1))
-        painter.drawLine(int(self.width() * 0.18), int(horizon), int(self.width() * 0.82), int(horizon))
-
-        title = "ESPACIO DE TRABAJO 3D"
-        painter.setPen(QColor("#a8adb8"))
-        font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
-        painter.setFont(font)
-        painter.drawText(28, 34, title)
-        painter.setPen(QColor("#6f7581"))
-        painter.setFont(QFont("Segoe UI", 9))
-        painter.drawText(28, 54, "Vista de escena · Perspectiva")
-
-        # Empty-scene marker and copy sit above the grid, leaving the canvas open.
-        cx, cy = int(center_x), int(center_y - 10)
-        painter.setPen(QPen(QColor("#46505d"), 1.4))
-        painter.drawEllipse(cx - 21, cy - 21, 42, 42)
-        painter.drawLine(cx - 10, cy, cx + 10, cy)
-        painter.drawLine(cx, cy - 10, cx, cy + 10)
-        painter.setPen(QColor("#c6cad2"))
-        painter.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
-        painter.drawText(cx - 120, cy + 54, 240, 22, Qt.AlignmentFlag.AlignCenter, "Tu escena empieza aquí")
-        painter.setPen(QColor("#777e8b"))
-        painter.setFont(QFont("Segoe UI", 9))
-        painter.drawText(cx - 160, cy + 77, 320, 22, Qt.AlignmentFlag.AlignCenter, "El espacio está listo para tus próximas herramientas")
 
 
 class MainWindow(QMainWindow):
@@ -198,7 +154,7 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self._nav_item("⌂", "Inicio", selected=True))
         side_layout.addWidget(self._nav_item("▧", "Proyectos"))
         side_layout.addStretch()
-        side_layout.addWidget(self._section_label("PUKI3D  ·  ETAPA 1"))
+        side_layout.addWidget(self._section_label("PUKI3D  ·  ETAPA 2"))
         outer.addWidget(side)
 
         content = QWidget()
@@ -322,6 +278,13 @@ class MainWindow(QMainWindow):
         self.save_state = QLabel("●  Guardado")
         self.save_state.setObjectName("muted")
         top_layout.addWidget(self.save_state)
+        add_button = QToolButton()
+        add_button.setText("＋ Añadir")
+        add_button.setObjectName("secondaryButton")
+        add_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.add_menu = QMenu(add_button)
+        add_button.setMenu(self.add_menu)
+        top_layout.addWidget(add_button)
         rename_button = QPushButton("Renombrar")
         rename_button.setObjectName("quietButton")
         rename_button.clicked.connect(self.rename_project)
@@ -332,6 +295,11 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(save_button)
         layout.addWidget(top)
 
+        self.add_menu_bar = self.menuBar().addMenu("Añadir")
+        self._add_primitive_actions(self.add_menu_bar)
+        self._add_primitive_actions(self.add_menu)
+        self.add_menu_bar.setEnabled(False)
+
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
@@ -341,12 +309,20 @@ class MainWindow(QMainWindow):
         rail_layout = QVBoxLayout(rail)
         rail_layout.setContentsMargins(8, 16, 8, 12)
         rail_layout.setSpacing(8)
-        for icon, label, active in (("▱", "Seleccionar", True), ("✥", "Transformar", False), ("◈", "Malla", False), ("▧", "Vista", False)):
+        self.tool_buttons = {}
+        self.tool_group = QButtonGroup(self)
+        self.tool_group.setExclusive(True)
+        for tool, icon, label in (("select", "↖", "Seleccionar"), ("move", "✥", "Mover"), ("rotate", "⟳", "Rotar"), ("scale", "⤢", "Escalar")):
             button = QPushButton(icon)
-            button.setObjectName("toolActive" if active else "toolButton")
+            button.setObjectName("toolActive" if tool == "select" else "toolButton")
             button.setToolTip(label)
             button.setAccessibleName(label)
             button.setFixedSize(44, 44)
+            button.setCheckable(True)
+            button.setChecked(tool == "select")
+            self.tool_group.addButton(button)
+            button.clicked.connect(lambda checked=False, current=tool: self._set_tool(current))
+            self.tool_buttons[tool] = button
             rail_layout.addWidget(button)
         rail_layout.addStretch()
         rail_layout.addWidget(self._divider())
@@ -358,6 +334,7 @@ class MainWindow(QMainWindow):
         body.addWidget(rail)
 
         canvas_area = QWidget()
+        canvas_area.setObjectName("canvasArea")
         canvas_layout = QVBoxLayout(canvas_area)
         canvas_layout.setContentsMargins(14, 14, 14, 12)
         canvas_layout.setSpacing(10)
@@ -370,7 +347,11 @@ class MainWindow(QMainWindow):
         view_mode.setObjectName("muted")
         canvas_toolbar.addWidget(view_mode)
         canvas_layout.addLayout(canvas_toolbar)
-        canvas_layout.addWidget(ViewportPlaceholder(), 1)
+        self.viewport = SceneViewport()
+        self.viewport.selectionChanged.connect(self._on_viewport_selection)
+        self.viewport.transformChanged.connect(self._on_viewport_transform)
+        self.viewport.sceneChanged.connect(self._mark_project_dirty)
+        canvas_layout.addWidget(self.viewport, 1)
         status = QHBoxLayout()
         status_label = QLabel("ESCENA PRINCIPAL")
         status_label.setObjectName("eyebrow")
@@ -401,29 +382,218 @@ class MainWindow(QMainWindow):
         scene_row_layout.addStretch()
         scene_row_layout.addWidget(QLabel("⌄"))
         inspector_layout.addWidget(scene_row)
-        empty = QLabel("La escena está vacía")
-        empty.setObjectName("muted")
-        empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        inspector_layout.addWidget(empty)
-        inspector_layout.addStretch()
+        self.outliner = QListWidget()
+        self.outliner.setObjectName("outliner")
+        self.outliner.currentRowChanged.connect(self._on_outliner_selection)
+        inspector_layout.addWidget(self.outliner, 2)
+        object_actions = QHBoxLayout()
+        object_actions.setContentsMargins(10, 8, 10, 8)
+        object_actions.setSpacing(6)
+        add_object = QToolButton()
+        add_object.setText("＋")
+        add_object.setToolTip("Añadir objeto")
+        add_object.setObjectName("secondaryButton")
+        add_object.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        object_menu = QMenu(add_object)
+        self._add_primitive_actions(object_menu)
+        add_object.setMenu(object_menu)
+        object_actions.addWidget(add_object)
+        duplicate_button = QPushButton("⧉")
+        duplicate_button.setToolTip("Duplicar objeto (Ctrl+D)")
+        duplicate_button.setObjectName("secondaryButton")
+        duplicate_button.clicked.connect(self.duplicate_selected)
+        object_actions.addWidget(duplicate_button)
+        delete_button = QPushButton("⌫")
+        delete_button.setToolTip("Eliminar objeto (Supr)")
+        delete_button.setObjectName("secondaryButton")
+        delete_button.clicked.connect(self.delete_selected)
+        object_actions.addWidget(delete_button)
+        object_actions.addStretch()
+        inspector_layout.addLayout(object_actions)
         inspector_layout.addWidget(self._divider())
-        properties_title = QLabel("PROPIEDADES DEL PROYECTO")
+        properties_title = QLabel("INSPECTOR")
         properties_title.setObjectName("panelHeading")
         inspector_layout.addWidget(properties_title)
-        self.info_name = QLabel("Nombre")
-        self.info_name.setObjectName("infoValue")
-        inspector_layout.addWidget(self.info_name)
-        self.info_kind = QLabel("Tipo")
-        self.info_kind.setObjectName("muted")
-        inspector_layout.addWidget(self.info_kind)
-        self.info_path = QLabel("")
-        self.info_path.setObjectName("muted")
-        self.info_path.setWordWrap(True)
-        inspector_layout.addWidget(self.info_path)
-        inspector_layout.addSpacing(18)
+        self.object_hint = QLabel("Selecciona un objeto")
+        self.object_hint.setObjectName("muted")
+        self.object_hint.setContentsMargins(16, 0, 8, 5)
+        inspector_layout.addWidget(self.object_hint)
+        self.transform_panel = QWidget()
+        self.transform_panel.setObjectName("transformPanel")
+        transform_layout = QGridLayout(self.transform_panel)
+        transform_layout.setContentsMargins(14, 2, 14, 14)
+        transform_layout.setHorizontalSpacing(4)
+        transform_layout.setVerticalSpacing(5)
+        self.transform_fields = {}
+        for axis_index, axis in enumerate("XYZ", start=1):
+            axis_label = QLabel(axis)
+            axis_label.setObjectName("axisLabel")
+            axis_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            transform_layout.addWidget(axis_label, 0, axis_index)
+        for row, (key, label) in enumerate((("position", "Posición"), ("rotation", "Rotación"), ("scale", "Escala")), start=1):
+            title = QLabel(label)
+            title.setObjectName("transformLabel")
+            transform_layout.addWidget(title, row, 0)
+            fields = []
+            for axis_index, axis in enumerate("XYZ", start=1):
+                field = QDoubleSpinBox()
+                field.setObjectName("transformField")
+                field.setDecimals(3)
+                field.setSingleStep(0.1 if key != "rotation" else 5.0)
+                field.setKeyboardTracking(False)
+                field.setRange(0.01, 10000.0) if key == "scale" else field.setRange(-100000.0, 100000.0)
+                field.setToolTip(f"{label} {axis}")
+                field.valueChanged.connect(self._apply_inspector_transform)
+                transform_layout.addWidget(field, row, axis_index)
+                fields.append(field)
+            self.transform_fields[key] = fields
+        inspector_layout.addWidget(self.transform_panel)
+        self.transform_panel.setEnabled(False)
         body.addWidget(inspector)
         layout.addLayout(body, 1)
+
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setSingleShot(True)
+        self.autosave_timer.setInterval(400)
+        self.autosave_timer.timeout.connect(self._save_project_silently)
+        for tool, shortcut in (("move", "W"), ("rotate", "E"), ("scale", "R"), ("select", "Q")):
+            action = QShortcut(shortcut, self.viewport)
+            action.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            action.activated.connect(lambda current=tool: self._set_tool(current))
+        delete_shortcut = QShortcut("Delete", self.viewport)
+        delete_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        delete_shortcut.activated.connect(self.delete_selected)
+        duplicate_shortcut = QShortcut("Ctrl+D", self.viewport)
+        duplicate_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        duplicate_shortcut.activated.connect(self.duplicate_selected)
         return root
+
+    def _add_primitive_actions(self, menu: QMenu) -> None:
+        for primitive, label in PRIMITIVES.items():
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked=False, kind=primitive: self.add_primitive(kind))
+            menu.addAction(action)
+
+    def _set_tool(self, tool: str) -> None:
+        self.viewport.set_tool(tool)
+        for current, button in self.tool_buttons.items():
+            button.setObjectName("toolActive" if current == tool else "toolButton")
+            button.style().unpolish(button)
+            button.style().polish(button)
+            button.update()
+
+    def _active_scene_nodes(self) -> list[dict]:
+        if not self.project:
+            return []
+        scenes = self.project.data.get("scenes", [])
+        index = self.project.data.get("editor", {}).get("active_scene", 0)
+        if not scenes:
+            scenes.append({"id": "main", "name": "Escena principal", "nodes": []})
+        index = max(0, min(index, len(scenes) - 1))
+        return scenes[index].setdefault("nodes", [])
+
+    def _refresh_outliner(self, selected_id: str | None = None) -> None:
+        nodes = self._active_scene_nodes()
+        self.outliner.blockSignals(True)
+        self.outliner.clear()
+        selected_row = -1
+        for row, node in enumerate(nodes):
+            item = QListWidgetItem(f"◈  {node.get('name', 'Objeto')}")
+            item.setData(Qt.ItemDataRole.UserRole, node.get("id"))
+            self.outliner.addItem(item)
+            if node.get("id") == selected_id:
+                selected_row = row
+        self.outliner.setCurrentRow(selected_row)
+        self.outliner.blockSignals(False)
+        self.viewport.set_nodes(nodes)
+        self.viewport.select_node(selected_id)
+
+    def _on_outliner_selection(self, row: int) -> None:
+        item = self.outliner.item(row) if row >= 0 else None
+        node_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        self.viewport.select_node(node_id)
+
+    def _on_viewport_selection(self, node) -> None:
+        node_id = node.get("id") if node else None
+        row = next((index for index in range(self.outliner.count()) if self.outliner.item(index).data(Qt.ItemDataRole.UserRole) == node_id), -1)
+        self.outliner.blockSignals(True)
+        self.outliner.setCurrentRow(row)
+        self.outliner.blockSignals(False)
+        self._update_transform_fields(node)
+
+    def _on_viewport_transform(self, node) -> None:
+        self._update_transform_fields(node)
+
+    def _update_transform_fields(self, node) -> None:
+        self.transform_panel.setEnabled(bool(node))
+        self.object_hint.setText(node.get("name", "Objeto") if node else "Selecciona un objeto")
+        for key, fields in self.transform_fields.items():
+            values = node.get("transform", {}).get(key, [1, 1, 1] if key == "scale" else [0, 0, 0]) if node else ([1, 1, 1] if key == "scale" else [0, 0, 0])
+            for field, value in zip(fields, values):
+                blocker = QSignalBlocker(field)
+                field.setValue(float(value))
+                del blocker
+
+    def _apply_inspector_transform(self) -> None:
+        node = self.viewport.selected_node
+        if not node:
+            return
+        for key, fields in self.transform_fields.items():
+            node.setdefault("transform", {})[key] = [field.value() for field in fields]
+        self.viewport.update()
+        self._mark_project_dirty()
+
+    def add_primitive(self, primitive: str) -> None:
+        if not self.project or primitive not in PRIMITIVES:
+            return
+        nodes = self._active_scene_nodes()
+        ordinal = sum(node.get("primitive") == primitive for node in nodes) + 1
+        node = create_node(primitive, ordinal)
+        if nodes:
+            node["transform"]["position"][0] = len(nodes) * 0.7
+        nodes.append(node)
+        self._refresh_outliner(node["id"])
+        self._mark_project_dirty()
+
+    def duplicate_selected(self) -> None:
+        selected = self.viewport.selected_node
+        if not self.project or not selected:
+            return
+        import copy
+        from uuid import uuid4
+        duplicate = copy.deepcopy(selected)
+        duplicate["id"] = str(uuid4())
+        duplicate["name"] = f"{selected.get('name', 'Objeto')} copia"
+        duplicate["transform"]["position"][0] += 0.75
+        nodes = self._active_scene_nodes()
+        nodes.append(duplicate)
+        self._refresh_outliner(duplicate["id"])
+        self._mark_project_dirty()
+
+    def delete_selected(self) -> None:
+        selected = self.viewport.selected_node
+        if not self.project or not selected:
+            return
+        nodes = self._active_scene_nodes()
+        nodes[:] = [node for node in nodes if node.get("id") != selected.get("id")]
+        self._refresh_outliner(None)
+        self._mark_project_dirty()
+
+    def _mark_project_dirty(self) -> None:
+        if self.project:
+            self.save_state.setText("●  Guardando…")
+            self.autosave_timer.start()
+
+    def _save_project_silently(self) -> None:
+        if not self.project:
+            return
+        try:
+            self.project.save()
+        except ProjectError as exc:
+            self.save_state.setText("●  Error al guardar")
+            QMessageBox.critical(self, "No se pudo guardar", str(exc))
+            return
+        self.save_state.setText("●  Guardado")
 
     def _brand(self, compact: bool = False) -> QWidget:
         widget = QWidget()
@@ -439,7 +609,7 @@ class MainWindow(QMainWindow):
         name.setObjectName("brandName")
         layout.addWidget(name)
         if not compact:
-            tag = QLabel("PROJECT")
+            tag = QLabel("MODEL")
             tag.setObjectName("brandTag")
             layout.addWidget(tag)
         return widget
@@ -553,11 +723,22 @@ class MainWindow(QMainWindow):
             #toolActive {{ background: #343a31; color: {ACCENT}; font-size: 16pt; }}
             #toolButton {{ background: transparent; color: #9ca2ad; font-size: 15pt; }}
             #viewport {{ border: 1px solid #2c3038; border-radius: 7px; }}
+            #outliner {{ background: transparent; border: 0; outline: 0; padding: 5px 9px; }}
+            #outliner::item {{ min-height: 31px; border-radius: 5px; padding: 4px 8px; }}
+            #outliner::item:selected {{ background: #303640; color: {TEXT}; border-left: 2px solid {ACCENT}; }}
+            #transformPanel {{ background: transparent; }}
+            #transformLabel {{ color: #b8bdc6; font-size: 9pt; }}
+            #axisLabel {{ color: {MUTED}; font-size: 8pt; font-weight: 700; }}
+            #transformField {{ min-width: 51px; max-width: 65px; padding: 4px 2px; background: #111318; border: 1px solid #353943; border-radius: 5px; }}
+            #toolActive:checked {{ background: #343a31; color: {ACCENT}; font-size: 16pt; }}
+            #toolButton:checked {{ background: #343a31; color: {ACCENT}; }}
         """)
 
     def _set_project_actions(self, enabled: bool) -> None:
         self.save_action.setEnabled(enabled)
         self.rename_action.setEnabled(enabled)
+        if hasattr(self, "add_menu_bar"):
+            self.add_menu_bar.setEnabled(enabled)
 
     def _refresh_recent(self) -> None:
         self.recent_list.clear()
@@ -625,17 +806,17 @@ class MainWindow(QMainWindow):
         self.project = project
         self.project_title.setText(project.name)
         self.project_type.setText(PROJECT_TYPES[project.kind])
-        self.info_name.setText(project.name)
-        self.info_kind.setText(PROJECT_TYPES[project.kind])
-        self.info_path.setText(str(project.path))
         self.save_state.setText("●  Guardado")
         self.setWindowTitle(f"{project.name} — Puki3D")
+        self._refresh_outliner(None)
+        self._update_transform_fields(None)
         self._set_project_actions(True)
         self.stack.setCurrentWidget(self.workspace)
 
     def save_project(self) -> None:
         if not self.project:
             return
+        self.autosave_timer.stop()
         try:
             self.project.save()
         except ProjectError as exc:
@@ -661,6 +842,7 @@ class MainWindow(QMainWindow):
 
     def show_home(self) -> None:
         if self.project:
+            self.autosave_timer.stop()
             try:
                 self.project.save()
             except ProjectError as exc:
@@ -674,6 +856,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt event API
         if self.project:
+            self.autosave_timer.stop()
             try:
                 self.project.save()
             except ProjectError as exc:
@@ -684,6 +867,13 @@ class MainWindow(QMainWindow):
 
 
 def run_app() -> int:
+    surface_format = QSurfaceFormat()
+    surface_format.setRenderableType(QSurfaceFormat.RenderableType.OpenGL)
+    surface_format.setVersion(2, 1)
+    surface_format.setProfile(QSurfaceFormat.OpenGLContextProfile.NoProfile)
+    surface_format.setDepthBufferSize(24)
+    surface_format.setSamples(4)
+    QSurfaceFormat.setDefaultFormat(surface_format)
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("Puki3D")
     app.setOrganizationName("Puki3D")
