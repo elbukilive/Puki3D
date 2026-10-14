@@ -14,6 +14,10 @@ from puki3d.scene import (
     create_node,
     ensure_editable_geometry,
     bevel_geometry,
+    fill_boundary_geometry,
+    bridge_boundary_geometry,
+    merge_vertices_geometry,
+    mesh_diagnostics,
     inset_face_geometry,
     loop_cut_geometry,
     mirrored_geometry,
@@ -24,6 +28,46 @@ from puki3d.scene import (
 
 
 class SceneTests(unittest.TestCase):
+    def test_fill_closes_one_planar_boundary_and_rejects_nonplanar_loop(self) -> None:
+        cube = primitive_geometry("cube")
+        opened = _geometry(cube["vertices"], cube["faces"][:-1])
+        boundary = {index for index, adjacent in enumerate(opened["edge_faces"]) if len(adjacent) == 1}
+        filled = fill_boundary_geometry(opened, boundary)
+        self.assertEqual(len(filled["faces"]), len(cube["faces"]))
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in filled["edge_faces"]))
+        self.assertEqual(mesh_diagnostics(filled)[0]["severity"], "ok")
+        warped = _geometry([[x + (0.2 if index == 4 else 0), y, z] for index, (x, y, z) in enumerate(opened["vertices"])], opened["faces"])
+        with self.assertRaises(MeshTopologyError):
+            fill_boundary_geometry(warped, boundary)
+
+    def test_bridge_connects_equal_boundary_loops_into_closed_shell(self) -> None:
+        first, second = primitive_geometry("cube"), primitive_geometry("cube")
+        vertices = first["vertices"] + [[x + 2, y, z] for x, y, z in second["vertices"]]
+        faces = first["faces"][:-1] + [[index + len(first["vertices"]) for index in face] for face in second["faces"][:-1]]
+        open_shells = _geometry(vertices, faces)
+        boundary = {index for index, adjacent in enumerate(open_shells["edge_faces"]) if len(adjacent) == 1}
+        bridged = bridge_boundary_geometry(open_shells, boundary)
+        self.assertEqual(len(bridged["faces"]), len(faces) + 4)
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in bridged["edge_faces"]))
+        self.assertNotIn("inconsistent_winding", {item["code"] for item in mesh_diagnostics(bridged)})
+
+    def test_merge_welds_loose_vertices_and_rejects_face_collapse(self) -> None:
+        loose = _geometry([[0, 0, 0], [0.1, 0, 0], [1, 0, 0]], [])
+        merged = merge_vertices_geometry(loose, {0, 1})
+        self.assertEqual(len(merged["vertices"]), 2)
+        coincident = _geometry([[0, 0, 0], [0, 0, 0]], [])
+        self.assertEqual(len(merge_vertices_geometry(coincident, {0, 1})["vertices"]), 1)
+        cube = primitive_geometry("cube")
+        with self.assertRaises(MeshTopologyError):
+            merge_vertices_geometry(cube, {0, 1})
+
+    def test_diagnostics_report_open_boundaries_and_duplicate_faces(self) -> None:
+        cube = primitive_geometry("cube")
+        opened = _geometry(cube["vertices"], cube["faces"][:-1])
+        self.assertIn("open_boundary", {item["code"] for item in mesh_diagnostics(opened)})
+        duplicated = _geometry(cube["vertices"], [*cube["faces"], cube["faces"][0]])
+        self.assertIn("duplicate_faces", {item["code"] for item in mesh_diagnostics(duplicated)})
+
     def test_supported_primitives_have_valid_triangulated_geometry(self) -> None:
         for primitive in PRIMITIVES:
             with self.subTest(primitive=primitive):
@@ -148,6 +192,7 @@ class SceneTests(unittest.TestCase):
         bevel = bevel_geometry(primitive_geometry("cube"), [0], 0.1)
         self.assertEqual(len(bevel["faces"]), 7)
         self.assertTrue(all(len(adjacent) == 2 for adjacent in bevel["edge_faces"]))
+        self.assertNotIn("loose_vertices", {item["code"] for item in mesh_diagnostics(bevel)})
         self.assertEqual(len(bevel["face_normals"]), len(bevel["faces"]))
 
     def test_bevel_handles_multiple_adjacent_edges_as_a_closed_surface(self) -> None:

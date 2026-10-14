@@ -33,6 +33,10 @@ from .scene import (
     _triangulate_face,
     ensure_editable_geometry,
     bevel_geometry,
+    fill_boundary_geometry,
+    bridge_boundary_geometry,
+    merge_vertices_geometry,
+    mesh_diagnostics,
     inset_face_geometry,
     loop_cut_geometry,
     mirrored_geometry,
@@ -59,6 +63,16 @@ def _silhouette_edge_ids(geometry: dict, eye_local: np.ndarray) -> list[int]:
     return result
 
 
+def _snap_axis_amount(start: float, amount: float, targets: list[float], step: float = 0.25,
+                      tolerance: float = 0.12) -> float:
+    """Snap an axis-constrained translation to the grid or a nearby vertex."""
+    snapped = round((start + amount) / step) * step
+    target = min(targets, key=lambda value: abs(value - snapped), default=None)
+    if target is not None and abs(target - snapped) <= tolerance:
+        snapped = target
+    return snapped - start
+
+
 class SceneViewport(QOpenGLWidget):
     selectionChanged = Signal(object)
     transformChanged = Signal(object)
@@ -66,6 +80,7 @@ class SceneViewport(QOpenGLWidget):
     modeChanged = Signal(str, str)
     extrusionStateChanged = Signal(bool)
     insetStateChanged = Signal(bool)
+    statusMessage = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -77,6 +92,7 @@ class SceneViewport(QOpenGLWidget):
         self.mode = "object"
         self.component_mode = "face"
         self.selected_components: set[int] = set()
+        self.snapping = False
         self._undo_stack: list[tuple[str, str, object]] = []
         self._redo_stack: list[tuple[str, str, object]] = []
         self.tool = "select"
@@ -205,6 +221,58 @@ class SceneViewport(QOpenGLWidget):
         if before != after:
             self._push_edit_history(self.selected_id, "geometry", before)
             self.sceneChanged.emit()
+            self.statusMessage.emit(self._topology_status(self.selected_node))
+
+    def _selected_boundary_edge_ids(self, geometry: dict) -> set[int]:
+        if self.component_mode == "edge":
+            return set(self.selected_components)
+        if self.component_mode == "vertex":
+            return {edge_id for edge_id, (a, b) in enumerate(geometry["edges"])
+                    if a in self.selected_components and b in self.selected_components
+                    and len(geometry["edge_faces"][edge_id]) == 1}
+        return set()
+
+    def _apply_topology_operation(self, operation, *, selection: set[int] | None = None) -> None:
+        node = self.selected_node
+        if self.mode != "edit" or node is None:
+            return
+        before = self._snapshot_geometry()
+        try:
+            node["geometry"] = operation(before)
+        except MeshTopologyError as exc:
+            self.statusMessage.emit(str(exc))
+            return
+        self.selected_components = set(selection or ())
+        self._record_geometry_change(before)
+        self.update()
+        self.statusMessage.emit(self._topology_status(node))
+
+    def _topology_status(self, node: dict) -> str:
+        diagnostics = mesh_diagnostics(node.get("geometry", {}))
+        return " · ".join(item["message"] for item in diagnostics if item["severity"] != "ok") or diagnostics[0]["message"]
+
+    def fill_selected_boundary(self) -> None:
+        node = self.selected_node
+        if node is None:
+            return
+        geometry = ensure_editable_geometry(node.get("geometry", {}))
+        edges = self._selected_boundary_edge_ids(geometry)
+        self._apply_topology_operation(lambda before: fill_boundary_geometry(before, edges))
+
+    def bridge_selected_boundaries(self) -> None:
+        node = self.selected_node
+        if node is None:
+            return
+        geometry = ensure_editable_geometry(node.get("geometry", {}))
+        edges = self._selected_boundary_edge_ids(geometry)
+        self._apply_topology_operation(lambda before: bridge_boundary_geometry(before, edges))
+
+    def merge_selected_vertices(self) -> None:
+        if self.component_mode != "vertex":
+            self.statusMessage.emit("Merge requiere el modo de vértices.")
+            return
+        selected = set(self.selected_components)
+        self._apply_topology_operation(lambda before: merge_vertices_geometry(before, selected))
 
     def _record_mirror_change(self, node: dict, before: dict | None) -> None:
         if before != node.get("mirror"):
@@ -226,6 +294,8 @@ class SceneViewport(QOpenGLWidget):
             node[kind] = value
         self.update()
         self.sceneChanged.emit()
+        if kind == "geometry":
+            self.statusMessage.emit(self._topology_status(node))
 
     def redo_edit(self) -> None:
         if not self._redo_stack:
@@ -242,6 +312,8 @@ class SceneViewport(QOpenGLWidget):
             node[kind] = value
         self.update()
         self.sceneChanged.emit()
+        if kind == "geometry":
+            self.statusMessage.emit(self._topology_status(node))
 
     def _evaluated_geometry(self, node: dict) -> tuple[dict, dict]:
         source = ensure_editable_geometry(node.setdefault("geometry", {}))
@@ -339,6 +411,7 @@ class SceneViewport(QOpenGLWidget):
             self.selected_components.clear()
             self._push_edit_history(state["node_id"], "geometry", state["before"])
             self.sceneChanged.emit()
+            self.statusMessage.emit(self._topology_status(node))
         elif node is not None:
             node["geometry"] = state["before"]
         self.update()
@@ -416,6 +489,7 @@ class SceneViewport(QOpenGLWidget):
         if state["amount"] > 1e-6:
             self._push_edit_history(state["node_id"], "geometry", state["before"])
             self.sceneChanged.emit()
+            self.statusMessage.emit(self._topology_status(self.selected_node))
         self.update()
 
     def _cancel_inset(self) -> None:
@@ -579,6 +653,7 @@ class SceneViewport(QOpenGLWidget):
             return
         self._push_edit_history(state["node_id"], "geometry", before)
         self.sceneChanged.emit()
+        self.statusMessage.emit(self._topology_status(self.selected_node))
 
     def _cancel_extrusion(self) -> None:
         state = self._extrusion
@@ -668,6 +743,19 @@ class SceneViewport(QOpenGLWidget):
         else:
             parameter = ray_axis_parameter(origin, direction, pivot_world, axis)
             amount = parameter - self._drag_axis_start if parameter is not None and self._drag_axis_start is not None else (point.x() - self._drag_start.x()) * 0.01
+        if self.snapping and self.tool == "move":
+            if len(indices) == 1:
+                selected_index = next(iter(indices))
+                selected_world = (matrix @ np.append(baseline[selected_index], 1.0))[:3]
+                targets = []
+                for index, vertex in enumerate(baseline):
+                    if index in indices:
+                        continue
+                    world = (matrix @ np.append(vertex, 1.0))[:3]
+                    targets.append(float(np.dot(world, axis)))
+                amount = _snap_axis_amount(float(np.dot(selected_world, axis)), amount, targets)
+            else:
+                amount = round(amount / 0.25) * 0.25
         baseline = self._drag_geometry["vertices"]
         matrix = node_matrix(node)
         inverse = np.linalg.inv(matrix)
@@ -1245,7 +1333,7 @@ class SceneViewport(QOpenGLWidget):
             self._cancel_extrusion()
             event.accept()
             return
-        if event.key() == Qt.Key.Key_F:
+        if event.key() == Qt.Key.Key_F and self.mode == "object":
             self.focus_selected()
             event.accept()
             return
@@ -1275,6 +1363,14 @@ class SceneViewport(QOpenGLWidget):
             return
         if self.mode == "edit" and event.key() == Qt.Key.Key_B:
             self.bevel_selected_edges()
+            event.accept()
+            return
+        if self.mode == "edit" and event.key() == Qt.Key.Key_F:
+            self.fill_selected_boundary()
+            event.accept()
+            return
+        if self.mode == "edit" and event.key() == Qt.Key.Key_M:
+            self.merge_selected_vertices()
             event.accept()
             return
         if event.key() == Qt.Key.Key_Escape and self._dragging_transform and self._drag_transform is not None:

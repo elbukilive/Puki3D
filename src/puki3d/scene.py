@@ -222,6 +222,192 @@ def ensure_editable_geometry(geometry: dict) -> dict:
     return geometry
 
 
+def _selected_boundary_loops(geometry: dict, edge_ids: set[int]) -> list[list[int]]:
+    """Order selected manifold boundary edges into simple closed vertex loops."""
+    edges, edge_faces = geometry["edges"], geometry["edge_faces"]
+    if not edge_ids:
+        raise MeshTopologyError("Selecciona los bordes de un contorno abierto.")
+    adjacency: dict[int, set[int]] = {}
+    for edge_id in edge_ids:
+        if edge_id < 0 or edge_id >= len(edges):
+            raise MeshTopologyError("La selección contiene una arista inexistente.")
+        if len(edge_faces[edge_id]) != 1:
+            raise MeshTopologyError("Fill y Bridge requieren aristas de borde con una sola cara.")
+        start, end = edges[edge_id]
+        adjacency.setdefault(start, set()).add(end)
+        adjacency.setdefault(end, set()).add(start)
+    if any(len(neighbors) != 2 for neighbors in adjacency.values()):
+        raise MeshTopologyError("Cada contorno debe ser un lazo cerrado sin ramificaciones.")
+    remaining = set(adjacency)
+    loops = []
+    while remaining:
+        start = min(remaining)
+        loop = [start]
+        previous = None
+        current = start
+        while True:
+            candidates = adjacency[current] - ({previous} if previous is not None else set())
+            following = min(candidates)
+            if following == start:
+                break
+            if following in loop:
+                raise MeshTopologyError("El contorno contiene un recorrido repetido.")
+            loop.append(following)
+            previous, current = current, following
+        if len(loop) < 3:
+            raise MeshTopologyError("Un contorno necesita al menos tres vértices.")
+        remaining.difference_update(loop)
+        loops.append(loop)
+    if sum(len(loop) for loop in loops) != len(adjacency):
+        raise MeshTopologyError("La selección no forma contornos independientes.")
+    return loops
+
+
+def _orient_boundary_loop(geometry: dict, loop: list[int], *, reverse_face_direction: bool) -> list[int]:
+    directed_boundary = {}
+    for face, face_edges in zip(geometry["faces"], geometry["face_edges"]):
+        for index, edge_id in enumerate(face_edges):
+            if len(geometry["edge_faces"][edge_id]) == 1:
+                directed_boundary[edge_id] = (face[index], face[(index + 1) % len(face)])
+    direction = []
+    for start, end in zip(loop, loop[1:] + loop[:1]):
+        edge_id = next((index for index, edge in enumerate(geometry["edges"]) if set(edge) == {start, end}), None)
+        if edge_id is None or edge_id not in directed_boundary:
+            raise MeshTopologyError("El contorno seleccionado no coincide con bordes abiertos de la malla.")
+        direction.append(directed_boundary[edge_id] == (start, end))
+    if all(direction):
+        return list(reversed(loop)) if reverse_face_direction else loop
+    if not any(direction):
+        return loop if reverse_face_direction else list(reversed(loop))
+    raise MeshTopologyError("La orientación del contorno es inconsistente.")
+
+
+def fill_boundary_geometry(geometry: dict, edge_ids: set[int]) -> dict:
+    """Close one planar boundary loop by adding a face with consistent winding."""
+    geometry = ensure_editable_geometry(dict(geometry))
+    loops = _selected_boundary_loops(geometry, set(edge_ids))
+    if len(loops) != 1:
+        raise MeshTopologyError("Fill requiere exactamente un contorno cerrado.")
+    loop = _orient_boundary_loop(geometry, loops[0], reverse_face_direction=True)
+    points = np.asarray([geometry["vertices"][index] for index in loop], dtype=float)
+    normal, _ = _face_normal(geometry["vertices"], loop)
+    scale = max(float(np.linalg.norm(points[(index + 1) % len(points)] - point)) for index, point in enumerate(points))
+    if any(abs(float(np.dot(point - points[0], normal))) > max(scale, 1.0) * 1e-6 for point in points):
+        raise MeshTopologyError("Fill requiere un contorno plano.")
+    return _geometry(geometry["vertices"], [*geometry["faces"], loop])
+
+
+def bridge_boundary_geometry(geometry: dict, edge_ids: set[int]) -> dict:
+    """Connect two equal-sized, planar boundary loops with a quad strip."""
+    geometry = ensure_editable_geometry(dict(geometry))
+    loops = _selected_boundary_loops(geometry, set(edge_ids))
+    if len(loops) != 2:
+        raise MeshTopologyError("Bridge requiere exactamente dos contornos cerrados.")
+    if len(loops[0]) != len(loops[1]):
+        raise MeshTopologyError("Bridge requiere contornos con el mismo número de vértices.")
+    first = _orient_boundary_loop(geometry, loops[0], reverse_face_direction=True)
+    second = _orient_boundary_loop(geometry, loops[1], reverse_face_direction=False)
+    vertices = np.asarray(geometry["vertices"], dtype=float)
+    # Preserve loop direction and choose the least stretched cyclic correspondence.
+    shifts = range(len(second))
+    shift = min(shifts, key=lambda offset: sum(
+        float(np.linalg.norm(vertices[first[index]] - vertices[second[(index + offset) % len(second)]]))
+        for index in range(len(first))
+    ))
+    second = second[shift:] + second[:shift]
+    bridge_faces = [
+        [first[index], first[(index + 1) % len(first)],
+         second[(index + 1) % len(second)], second[index]]
+        for index in range(len(first))
+    ]
+    return _geometry(geometry["vertices"], [*geometry["faces"], *bridge_faces])
+
+
+def merge_vertices_geometry(geometry: dict, vertex_ids: set[int]) -> dict:
+    """Weld selected vertices at their centroid, rejecting any collapsed face."""
+    geometry = ensure_editable_geometry(dict(geometry))
+    vertex_ids = set(vertex_ids)
+    vertices, faces = geometry["vertices"], geometry["faces"]
+    if len(vertex_ids) < 2:
+        raise MeshTopologyError("Merge requiere seleccionar al menos dos vértices.")
+    if any(index < 0 or index >= len(vertices) for index in vertex_ids):
+        raise MeshTopologyError("La selección contiene un vértice inexistente.")
+    ordered = sorted(vertex_ids)
+    anchor = ordered[0]
+    center = np.mean(np.asarray([vertices[index] for index in ordered], dtype=float), axis=0)
+    kept = [index for index in range(len(vertices)) if index not in vertex_ids or index == anchor]
+    remap = {old: new for new, old in enumerate(kept)}
+    mapped_anchor = remap[anchor]
+    merged_vertices = [list(center) if index == anchor else list(vertices[index]) for index in kept]
+    merged_faces = []
+    seen_faces = set()
+    for face in faces:
+        mapped = [mapped_anchor if index in vertex_ids else remap[index] for index in face]
+        if len(set(mapped)) < 3:
+            raise MeshTopologyError("Merge cancelado: soldar esos vértices colapsaría una cara.")
+        canonical = min(tuple(mapped[index:] + mapped[:index]) for index in range(len(mapped)))
+        reverse = list(reversed(mapped))
+        canonical = min(canonical, min(tuple(reverse[index:] + reverse[:index]) for index in range(len(reverse))))
+        if canonical in seen_faces:
+            raise MeshTopologyError("Merge cancelado: crearía caras duplicadas.")
+        seen_faces.add(canonical)
+        merged_faces.append(mapped)
+    result = _geometry(merged_vertices, merged_faces)
+    if any(len(adjacent) > 2 for adjacent in result["edge_faces"]):
+        raise MeshTopologyError("Merge cancelado: produciría aristas no manifold.")
+    return result
+
+
+def mesh_diagnostics(geometry: dict) -> list[dict]:
+    """Return non-blocking topology warnings for open, loose, or invalid mesh data."""
+    try:
+        geometry = ensure_editable_geometry(dict(geometry))
+    except (MeshTopologyError, IndexError, TypeError, ValueError) as exc:
+        return [{"severity": "error", "code": "invalid_geometry", "message": f"Malla no válida: {exc}"}]
+    diagnostics = []
+    boundary_ids = [index for index, adjacent in enumerate(geometry["edge_faces"]) if len(adjacent) == 1]
+    nonmanifold_ids = [index for index, adjacent in enumerate(geometry["edge_faces"]) if len(adjacent) > 2]
+    used = {index for face in geometry["faces"] for index in face}
+    loose_ids = [index for index in range(len(geometry["vertices"])) if index not in used]
+    if boundary_ids:
+        diagnostics.append({"severity": "warning", "code": "open_boundary", "count": len(boundary_ids),
+                            "message": f"Hay {len(boundary_ids)} aristas abiertas; la superficie tiene huecos."})
+    if nonmanifold_ids:
+        diagnostics.append({"severity": "error", "code": "non_manifold", "count": len(nonmanifold_ids),
+                            "message": f"Hay {len(nonmanifold_ids)} aristas compartidas por más de dos caras."})
+    face_keys = set()
+    duplicate_faces = 0
+    for face in geometry["faces"]:
+        rotations = [tuple(face[index:] + face[:index]) for index in range(len(face))]
+        reverse = list(reversed(face))
+        rotations.extend(tuple(reverse[index:] + reverse[:index]) for index in range(len(reverse)))
+        key = min(rotations)
+        if key in face_keys:
+            duplicate_faces += 1
+        face_keys.add(key)
+    if duplicate_faces:
+        diagnostics.append({"severity": "error", "code": "duplicate_faces", "count": duplicate_faces,
+                            "message": f"Se detectaron {duplicate_faces} caras duplicadas."})
+    inconsistent_edges = []
+    directed = {}
+    edge_lookup = {tuple(edge): edge_id for edge_id, edge in enumerate(geometry["edges"])}
+    for face_id, face in enumerate(geometry["faces"]):
+        for start, end in zip(face, face[1:] + face[:1]):
+            edge_id = edge_lookup[tuple(sorted((start, end)))]
+            if edge_id in directed and directed[edge_id][1] == (start, end):
+                inconsistent_edges.append(edge_id)
+            directed[edge_id] = (face_id, (start, end))
+    if inconsistent_edges:
+        diagnostics.append({"severity": "warning", "code": "inconsistent_winding", "count": len(set(inconsistent_edges)),
+                            "message": f"Hay {len(set(inconsistent_edges))} aristas con caras orientadas igual."})
+    if loose_ids:
+        diagnostics.append({"severity": "warning", "code": "loose_vertices", "count": len(loose_ids),
+                            "message": f"Hay {len(loose_ids)} vértices sin caras conectadas."})
+    if not diagnostics:
+        diagnostics.append({"severity": "ok", "code": "closed_manifold", "message": "Malla cerrada: no se detectaron huecos ni aristas no manifold."})
+    return diagnostics
+
+
 def loop_cut_geometry(geometry: dict, edge_id: int, fraction: float = 0.5) -> dict:
     """Insert one continuous cut through a closed loop of quad faces."""
     geometry = ensure_editable_geometry(dict(geometry))
@@ -281,6 +467,8 @@ def bevel_geometry(geometry: dict, edge_ids: list[int] | set[int], width: float)
     geometry = ensure_editable_geometry(dict(geometry))
     if not np.isfinite(width) or width <= 0:
         raise MeshTopologyError("El ancho de Bevel debe ser positivo.")
+    initially_used = {index for face in geometry["faces"] for index in face}
+    initially_loose = set(range(len(geometry["vertices"]))) - initially_used
     mesh_vertices = np.asarray(geometry["vertices"], dtype=float)
     mesh_center = np.mean(mesh_vertices, axis=0)
     convex = True
@@ -392,6 +580,12 @@ def bevel_geometry(geometry: dict, edge_ids: list[int] | set[int], width: float)
         boundary_count = sum(count == 1 for count in incidences)
         if any(count > 2 for count in incidences) or boundary_count > original_boundary_count:
             raise MeshTopologyError("Bevel crearía bordes abiertos o más de dos caras por arista.")
+    used = {index for face in result["faces"] for index in face} | initially_loose
+    if len(used) != len(result["vertices"]):
+        kept = sorted(used)
+        remap = {old: new for new, old in enumerate(kept)}
+        result = _geometry([result["vertices"][index] for index in kept],
+                           [[remap[index] for index in face] for face in result["faces"]])
     return result
 
 

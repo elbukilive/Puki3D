@@ -12,12 +12,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QToolButton
 
 from puki3d.project import Project
 from puki3d.scene import _geometry, node_matrix
 from puki3d.ui import MainWindow
-from puki3d.viewport import _silhouette_edge_ids
+from puki3d.viewport import _silhouette_edge_ids, _snap_axis_amount
 
 
 class WorkspaceSyncTests(unittest.TestCase):
@@ -53,6 +53,56 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.window.viewport.select_node(None)
         self.assertEqual(self.window.outliner.currentRow(), -1)
         self.assertFalse(self.window.transform_panel.isEnabled())
+
+    def test_modeling_tools_are_grouped_and_enabled_for_the_active_component_mode(self) -> None:
+        grouped_tools = {button.text() for button in self.window.findChildren(QToolButton)}
+        self.assertIn("Modelado", grouped_tools)
+        self.assertIn("Topología", grouped_tools)
+
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        viewport.set_mode("edit")
+        viewport.set_component_mode("vertex")
+        self.assertTrue(self.window.fill_action.isEnabled())
+        self.assertTrue(self.window.bridge_action.isEnabled())
+        self.assertTrue(self.window.merge_action.isEnabled())
+
+        viewport.set_component_mode("face")
+        self.assertTrue(self.window.inset_action.isEnabled())
+        self.assertFalse(self.window.fill_action.isEnabled())
+
+        viewport.set_component_mode("edge")
+        self.assertTrue(self.window.loop_cut_action.isEnabled())
+        self.assertTrue(self.window.bevel_action.isEnabled())
+
+    def test_axis_snapping_targets_grid_and_nearby_vertices(self) -> None:
+        self.assertAlmostEqual(_snap_axis_amount(0.12, 0.18, []), 0.13)
+        self.assertAlmostEqual(_snap_axis_amount(0.12, 0.22, [0.34]), 0.22)
+
+    def test_topology_diagnostics_refresh_after_geometry_changes_and_undo(self) -> None:
+        self.window.add_primitive("cube")
+        viewport, node = self.window.viewport, self.window.viewport.selected_node
+        viewport.set_mode("edit")
+        before = copy.deepcopy(node["geometry"])
+        node["geometry"] = _geometry(before["vertices"], before["faces"][:-1])
+        viewport._record_geometry_change(before)
+        self.assertIn("aristas abiertas", self.window.edit_status.text())
+        viewport.undo_edit()
+        self.assertIn("Malla cerrada", self.window.edit_status.text())
+
+    def test_fill_shortcut_closes_selected_boundary_in_edit_mode(self) -> None:
+        self.window.add_primitive("cube")
+        viewport, node = self.window.viewport, self.window.viewport.selected_node
+        geometry = node["geometry"]
+        node["geometry"] = _geometry(geometry["vertices"], geometry["faces"][:-1])
+        viewport.set_mode("edit")
+        viewport.set_component_mode("vertex")
+        viewport.selected_components = set(range(len(geometry["vertices"])))
+
+        QTest.keyClick(viewport, Qt.Key.Key_F)
+
+        self.assertEqual(len(node["geometry"]["faces"]), 6)
+        self.assertIn("Malla cerrada", self.window.edit_status.text())
 
     def test_object_selection_outline_uses_mesh_silhouette_not_triangulation(self) -> None:
         self.window.add_primitive("cube")
@@ -208,6 +258,54 @@ class WorkspaceSyncTests(unittest.TestCase):
         reopened = Project.load(self.project.path)
         loaded = reopened.data["scenes"][0]["nodes"][0]
         self.assertEqual(loaded["mirror"], node["mirror"])
+        self.assertEqual(loaded["geometry"], node["geometry"])
+
+    def test_fill_operation_undoes_redoes_and_persists_with_mirror_enabled(self) -> None:
+        self.window.add_primitive("cube")
+        viewport, node = self.window.viewport, self.window.viewport.selected_node
+        viewport.set_mode("edit")
+        node["geometry"] = _geometry(
+            [[0, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0, 0.5, -0.5],
+             [0, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [0, 0.5, 0.5]],
+            [[0, 4, 7, 3], [1, 2, 6, 5], [0, 3, 2, 1], [0, 1, 5, 4], [3, 7, 6, 2]],
+        )
+        viewport.set_component_mode("edge")
+        viewport.selected_components = {index for index, adjacent in enumerate(node["geometry"]["edge_faces"]) if len(adjacent) == 1}
+        viewport.set_mirror_axis(0)
+        before_fill = copy.deepcopy(node["geometry"])
+        viewport.fill_selected_boundary()
+        self.assertEqual(len(node["geometry"]["faces"]), 6)
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in node["geometry"]["edge_faces"]))
+        viewport.undo_edit()
+        self.assertEqual(node["geometry"], before_fill)
+        viewport.redo_edit()
+        self.assertEqual(len(node["geometry"]["faces"]), 6)
+        self.window.save_project()
+        loaded = Project.load(self.project.path).data["scenes"][0]["nodes"][0]
+        self.assertEqual(loaded["geometry"], node["geometry"])
+        self.assertEqual(loaded["mirror"], node["mirror"])
+
+    def test_bridge_operation_undoes_redoes_and_persists(self) -> None:
+        self.window.add_primitive("cube")
+        viewport, node = self.window.viewport, self.window.viewport.selected_node
+        first = node["geometry"]
+        second = copy.deepcopy(first)
+        node["geometry"] = _geometry(
+            first["vertices"] + [[x + 2, y, z] for x, y, z in second["vertices"]],
+            first["faces"][:-1] + [[index + 8 for index in face] for face in second["faces"][:-1]],
+        )
+        viewport.set_mode("edit")
+        viewport.set_component_mode("edge")
+        viewport.selected_components = {index for index, adjacent in enumerate(node["geometry"]["edge_faces"]) if len(adjacent) == 1}
+        before = copy.deepcopy(node["geometry"])
+        viewport.bridge_selected_boundaries()
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in node["geometry"]["edge_faces"]))
+        viewport.undo_edit()
+        self.assertEqual(node["geometry"], before)
+        viewport.redo_edit()
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in node["geometry"]["edge_faces"]))
+        self.window.save_project()
+        loaded = Project.load(self.project.path).data["scenes"][0]["nodes"][0]
         self.assertEqual(loaded["geometry"], node["geometry"])
 
     def test_edit_face_picking_uses_the_face_under_the_cursor(self) -> None:
