@@ -1,6 +1,6 @@
-# Puki3D
+﻿# Puki3D
 
-Aplicación de escritorio en Python para crear y editar modelos 3D desde cero, con especial atención a vehículos, accesorios y otros objetos compatibles con American Truck Simulator.
+Aplicación de escritorio para organizar proyectos de vehículos, accesorios y objetos 3D. La etapa PROJECT incluye creación y apertura de proyectos, guardado en formato propio y un workspace preparado para futuras escenas y herramientas.
 
 ## Requisitos
 
@@ -16,10 +16,10 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-## Comprobar el entorno
+## Iniciar la aplicación
 
 ```powershell
 puki3d
 ```
 
-El comando comprueba e informa las versiones de Python, PySide6, PyOpenGL y NumPy. La interfaz y las herramientas 3D todavía no están implementadas.
+Los proyectos nuevos se guardan automáticamente en `Documents\Puki3D Projects` como archivos `.puki3d` legibles en JSON y versionados con un esquema propio.
