@@ -222,6 +222,179 @@ def ensure_editable_geometry(geometry: dict) -> dict:
     return geometry
 
 
+def loop_cut_geometry(geometry: dict, edge_id: int, fraction: float = 0.5) -> dict:
+    """Insert one continuous cut through a closed loop of quad faces."""
+    geometry = ensure_editable_geometry(dict(geometry))
+    edges, edge_faces, faces = geometry["edges"], geometry["edge_faces"], geometry["faces"]
+    if edge_id < 0 or edge_id >= len(edges) or not 0.0 < fraction < 1.0:
+        raise MeshTopologyError("Loop Cut requiere una arista válida y una posición interior.")
+    crossed_edges, crossed_faces = {edge_id}, set()
+    pending = [edge_id]
+    while pending:
+        current = pending.pop()
+        adjacent = edge_faces[current]
+        if len(adjacent) != 2:
+            raise MeshTopologyError("Loop Cut requiere una topología cerrada y manifold.")
+        for face_id in adjacent:
+            face = faces[face_id]
+            if len(face) != 4:
+                raise MeshTopologyError("Loop Cut solo continúa por caras cuadriláteras.")
+            if face_id in crossed_faces:
+                continue
+            crossed_faces.add(face_id)
+            edge_position = geometry["face_edges"][face_id].index(current)
+            opposite = geometry["face_edges"][face_id][(edge_position + 2) % 4]
+            if opposite not in crossed_edges:
+                crossed_edges.add(opposite)
+                pending.append(opposite)
+    # Every crossed edge must be paired by the traversed quads; otherwise this is an open loop.
+    for current in crossed_edges:
+        if len(edge_faces[current]) != 2 or not all(face_id in crossed_faces for face_id in edge_faces[current]):
+            raise MeshTopologyError("Loop Cut encontró un límite y se canceló sin modificar la malla.")
+    vertices = [list(vertex) for vertex in geometry["vertices"]]
+    split_ids = {}
+    for current in crossed_edges:
+        start, end = edges[current]
+        point = np.asarray(vertices[start]) * (1.0 - fraction) + np.asarray(vertices[end]) * fraction
+        split_ids[current] = len(vertices)
+        vertices.append(point.tolist())
+    result_faces = []
+    for face_id, face in enumerate(faces):
+        face_edges = geometry["face_edges"][face_id]
+        positions = [index for index, current in enumerate(face_edges) if current in crossed_edges]
+        if len(positions) != 2:
+            if face_id in crossed_faces:
+                raise MeshTopologyError("La topología no permite cerrar este Loop Cut.")
+            result_faces.append(list(face))
+            continue
+        first, second = positions
+        if (first - second) % 4 != 2:
+            raise MeshTopologyError("Loop Cut no encontró aristas opuestas en una cara.")
+        first_id, second_id = split_ids[face_edges[first]], split_ids[face_edges[second]]
+        result_faces.append([first_id, *face[(first + 1):(second + 1)], second_id])
+        result_faces.append([second_id, *face[(second + 1):] + face[:first + 1], first_id])
+    return _geometry(vertices, result_faces)
+
+
+def bevel_geometry(geometry: dict, edge_ids: list[int] | set[int], width: float) -> dict:
+    """Chamfer selected manifold edges with one segment and reject open results."""
+    geometry = ensure_editable_geometry(dict(geometry))
+    if not np.isfinite(width) or width <= 0:
+        raise MeshTopologyError("El ancho de Bevel debe ser positivo.")
+    mesh_vertices = np.asarray(geometry["vertices"], dtype=float)
+    mesh_center = np.mean(mesh_vertices, axis=0)
+    convex = True
+    for face, normal in zip(geometry["faces"], geometry["face_normals"]):
+        anchor = mesh_vertices[face[0]]
+        signed = [float(np.dot(point - anchor, normal)) for point in mesh_vertices]
+        if not (max(signed) <= 1e-6 or min(signed) >= -1e-6):
+            convex = False
+            break
+    oriented_faces = []
+    if convex:
+        for face, normal in zip(geometry["faces"], geometry["face_normals"]):
+            anchor = np.asarray(geometry["vertices"][face[0]])
+            oriented_faces.append(list(face) if float(np.dot(np.asarray(normal), mesh_center - anchor)) <= 1e-8 else list(reversed(face)))
+        geometry = _geometry(geometry["vertices"], oriented_faces)
+    edges, edge_faces = geometry["edges"], geometry["edge_faces"]
+    if not edge_ids:
+        raise MeshTopologyError("Selecciona al menos una arista para Bevel.")
+    vertices = geometry["vertices"]
+    original_boundary_count = sum(len(adjacent) == 1 for adjacent in edge_faces)
+    planes = []
+    for edge_id in sorted(set(edge_ids)):
+        if edge_id < 0 or edge_id >= len(edges):
+            raise MeshTopologyError("La arista seleccionada ya no existe.")
+        adjacent = edge_faces[edge_id]
+        if len(adjacent) != 2:
+            raise MeshTopologyError("Bevel requiere aristas manifold con dos caras.")
+        normals = [np.asarray(geometry["face_normals"][face_id], dtype=float) for face_id in adjacent]
+        bevel_normal = normals[0] + normals[1]
+        length = float(np.linalg.norm(bevel_normal))
+        if length <= 1e-10:
+            raise MeshTopologyError("No se puede biselar una arista con caras coplanares opuestas.")
+        bevel_normal /= length
+        midpoint = (np.asarray(vertices[edges[edge_id][0]]) + np.asarray(vertices[edges[edge_id][1]])) * 0.5
+        plane = float(np.dot(bevel_normal, midpoint) - width * max(float(np.dot(bevel_normal, normals[0])), 1e-6))
+        planes.append((bevel_normal, plane))
+    result = geometry
+    for bevel_normal, plane in planes:
+        vertices = result["vertices"]
+        new_vertices = [list(vertex) for vertex in vertices]
+        clipped_faces, cap_segments, intersections = [], [], {}
+        for face in result["faces"]:
+            clipped, face_crossings = [], []
+            for start, end in zip(face, face[1:] + face[:1]):
+                a, b = np.asarray(vertices[start]), np.asarray(vertices[end])
+                da, db = float(np.dot(bevel_normal, a) - plane), float(np.dot(bevel_normal, b) - plane)
+                inside_a, inside_b = da <= 1e-9, db <= 1e-9
+                if inside_a:
+                    clipped.append(start)
+                if inside_a != inside_b:
+                    key = tuple(sorted((start, end)))
+                    if key not in intersections:
+                        t = da / (da - db)
+                        intersections[key] = len(new_vertices)
+                        new_vertices.append((a + (b - a) * t).tolist())
+                    intersection_id = intersections[key]
+                    clipped.append(intersection_id)
+                    face_crossings.append(intersection_id)
+            deduplicated = []
+            for index in clipped:
+                if not deduplicated or index != deduplicated[-1]:
+                    deduplicated.append(index)
+            if len(deduplicated) > 1 and deduplicated[0] == deduplicated[-1]:
+                deduplicated.pop()
+            if len(deduplicated) >= 3:
+                clipped_faces.append(deduplicated)
+            if len(set(face_crossings)) == 2:
+                cap_segments.append(tuple(set(face_crossings)))
+        adjacency: dict[int, set[int]] = {}
+        for start, end in cap_segments:
+            adjacency.setdefault(start, set()).add(end)
+            adjacency.setdefault(end, set()).add(start)
+        if len(adjacency) < 3 or any(len(neighbors) != 2 for neighbors in adjacency.values()):
+            raise MeshTopologyError("El ancho de Bevel es demasiado grande o colapsa la malla.")
+        cap_cycles = []
+        remaining = set(adjacency)
+        while remaining:
+            start = min(remaining)
+            cycle = [start]
+            previous, current = None, start
+            while True:
+                candidates = adjacency[current] - ({previous} if previous is not None else set())
+                following = min(candidates)
+                if following == start:
+                    break
+                if following in cycle:
+                    raise MeshTopologyError("El corte de Bevel no forma ciclos simples.")
+                cycle.append(following)
+                previous, current = current, following
+            if len(cycle) < 3:
+                raise MeshTopologyError("El ancho de Bevel es demasiado grande o colapsa la malla.")
+            remaining.difference_update(cycle)
+            cap_cycles.append(cycle)
+        helper = np.eye(3)[int(np.argmin(np.abs(bevel_normal)))]
+        axis_u = np.cross(bevel_normal, helper)
+        axis_u /= np.linalg.norm(axis_u)
+        axis_v = np.cross(bevel_normal, axis_u)
+        for cap in cap_cycles:
+            center = np.mean([new_vertices[index] for index in cap], axis=0)
+            cap.sort(key=lambda index: np.arctan2(
+                np.dot(np.asarray(new_vertices[index]) - center, axis_v),
+                np.dot(np.asarray(new_vertices[index]) - center, axis_u),
+            ))
+            if np.dot(np.cross(np.asarray(new_vertices[cap[1]]) - new_vertices[cap[0]], np.asarray(new_vertices[cap[2]]) - new_vertices[cap[0]]), bevel_normal) < 0:
+                cap.reverse()
+            clipped_faces.append(cap)
+        result = _geometry(new_vertices, clipped_faces)
+        incidences = [len(adjacent) for adjacent in result["edge_faces"]]
+        boundary_count = sum(count == 1 for count in incidences)
+        if any(count > 2 for count in incidences) or boundary_count > original_boundary_count:
+            raise MeshTopologyError("Bevel crearía bordes abiertos o más de dos caras por arista.")
+    return result
+
+
 def inset_face_geometry(geometry: dict, face_id: int, amount: float) -> dict:
     """Return a mesh with one convex polygon face inset by a world/local distance."""
     geometry = ensure_editable_geometry(dict(geometry))

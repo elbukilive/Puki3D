@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication
 from puki3d.project import Project
 from puki3d.scene import _geometry, node_matrix
 from puki3d.ui import MainWindow
+from puki3d.viewport import _silhouette_edge_ids
 
 
 class WorkspaceSyncTests(unittest.TestCase):
@@ -52,6 +53,13 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.window.viewport.select_node(None)
         self.assertEqual(self.window.outliner.currentRow(), -1)
         self.assertFalse(self.window.transform_panel.isEnabled())
+
+    def test_object_selection_outline_uses_mesh_silhouette_not_triangulation(self) -> None:
+        self.window.add_primitive("cube")
+        geometry = self.window.viewport.selected_node["geometry"]
+        edges = _silhouette_edge_ids(geometry, np.array([4.0, 4.0, 4.0]))
+        self.assertEqual(len(edges), 6)
+        self.assertTrue(all(edge_id < len(geometry["edges"]) for edge_id in edges))
 
     def test_edit_mode_extrudes_and_undo_redo_persists_mesh(self) -> None:
         self.window.add_primitive("cube")
@@ -132,6 +140,49 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.window.save_project()
         reopened = Project.load(self.project.path)
         self.assertEqual(reopened.data["scenes"][0]["nodes"][0]["geometry"], node["geometry"])
+
+    def test_loop_cut_preview_commits_undoes_redoes_and_persists(self) -> None:
+        self.window.add_primitive("cube")
+        viewport, node = self.window.viewport, self.window.viewport.selected_node
+        viewport.set_mode("edit")
+        viewport.set_component_mode("edge")
+        viewport.selected_components = {0}
+        original = copy.deepcopy(node["geometry"])
+        viewport._last_mouse = QPoint(200, 200)
+        viewport.loop_cut_selected_edge()
+        self.assertIsNotNone(viewport._loop_cut)
+        QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=QPoint(200, 200))
+        QTest.mouseMove(viewport, QPoint(224, 200))
+        QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=QPoint(224, 200))
+        self.assertIsNone(viewport._loop_cut)
+        self.assertEqual(len(node["geometry"]["faces"]), 10)
+        viewport.undo_edit()
+        self.assertEqual(node["geometry"], original)
+        viewport.redo_edit()
+        self.assertEqual(len(node["geometry"]["edges"]), 20)
+        self.window.save_project()
+        loaded = Project.load(self.project.path).data["scenes"][0]["nodes"][0]
+        self.assertEqual(loaded["geometry"], node["geometry"])
+
+    def test_bevel_preview_commits_undoes_and_redoes(self) -> None:
+        self.window.add_primitive("cube")
+        viewport, node = self.window.viewport, self.window.viewport.selected_node
+        viewport.set_mode("edit")
+        viewport.set_component_mode("edge")
+        viewport.selected_components = {0}
+        original = copy.deepcopy(node["geometry"])
+        viewport._last_mouse = QPoint(200, 200)
+        viewport.bevel_selected_edges()
+        self.assertIsNotNone(viewport._bevel)
+        QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=QPoint(200, 200))
+        QTest.mouseMove(viewport, QPoint(202, 200))
+        QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=QPoint(202, 200))
+        self.assertIsNone(viewport._bevel)
+        self.assertEqual(len(node["geometry"]["faces"]), 7)
+        viewport.undo_edit()
+        self.assertEqual(node["geometry"], original)
+        viewport.redo_edit()
+        self.assertEqual(len(node["geometry"]["faces"]), 7)
 
     def test_mirror_modifier_is_welded_toggleable_undoable_and_persistent(self) -> None:
         self.window.add_primitive("cube")

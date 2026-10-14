@@ -32,11 +32,31 @@ from .scene import (
     MeshTopologyError,
     _triangulate_face,
     ensure_editable_geometry,
+    bevel_geometry,
     inset_face_geometry,
+    loop_cut_geometry,
     mirrored_geometry,
     node_matrix,
     raycast,
 )
+
+
+def _silhouette_edge_ids(geometry: dict, eye_local: np.ndarray) -> list[int]:
+    """Return real mesh edges on the camera-facing silhouette, excluding triangulation diagonals."""
+    vertices = np.asarray(geometry.get("vertices", []), dtype=float)
+    faces = geometry.get("faces", [])
+    normals = geometry.get("face_normals", [])
+    if not len(vertices) or len(faces) != len(normals):
+        return []
+    facing = []
+    for face, normal in zip(faces, normals):
+        center = np.mean(vertices[face], axis=0)
+        facing.append(float(np.dot(np.asarray(normal), eye_local - center)) > 1e-8)
+    result = []
+    for edge_id, adjacent in enumerate(geometry.get("edge_faces", [])):
+        if len(adjacent) != 2 or facing[adjacent[0]] != facing[adjacent[1]]:
+            result.append(edge_id)
+    return result
 
 
 class SceneViewport(QOpenGLWidget):
@@ -71,6 +91,9 @@ class SceneViewport(QOpenGLWidget):
         self._extrusion_dragging = False
         self._inset: dict | None = None
         self._inset_dragging = False
+        self._loop_cut: dict | None = None
+        self._bevel: dict | None = None
+        self._operation_dragging = False
         self._dragging_transform = False
         self._drag_axis: int | None = None
         self._drag_axis_start: float | None = None
@@ -242,6 +265,93 @@ class SceneViewport(QOpenGLWidget):
             mirrored_geometry(node.get("geometry", {}), int(axis))
             node["mirror"] = {"axis": int(axis), "merge": True, "clip": True}
         self._record_mirror_change(node, before)
+        self.update()
+
+    def loop_cut_selected_edge(self) -> None:
+        node = self.selected_node
+        if self.mode != "edit" or self.component_mode != "edge" or node is None or len(self.selected_components) != 1:
+            return
+        before = self._snapshot_geometry()
+        edge_id = next(iter(self.selected_components))
+        try:
+            preview = loop_cut_geometry(before, edge_id, 0.5)
+        except MeshTopologyError:
+            return
+        self._loop_cut = {"node_id": node["id"], "before": before, "edge_id": edge_id,
+                          "preview": preview, "start_mouse": QPoint(self._last_mouse), "fraction": 0.5}
+        node["geometry"] = preview
+        self.update()
+
+    def _set_loop_fraction(self, fraction: float) -> None:
+        state, node = self._loop_cut, self.selected_node
+        if state is None or node is None or node["id"] != state["node_id"]:
+            return
+        fraction = float(np.clip(fraction, 0.05, 0.95))
+        try:
+            state["preview"] = loop_cut_geometry(state["before"], state["edge_id"], fraction)
+        except MeshTopologyError:
+            return
+        state["fraction"] = fraction
+        node["geometry"] = deepcopy(state["preview"])
+        self.update()
+
+    def bevel_selected_edges(self) -> None:
+        node = self.selected_node
+        if self.mode != "edit" or self.component_mode != "edge" or node is None or not self.selected_components:
+            return
+        before = self._snapshot_geometry()
+        try:
+            preview = bevel_geometry(before, self.selected_components, 0.01)
+        except MeshTopologyError:
+            return
+        self._bevel = {"node_id": node["id"], "before": before, "edge_ids": set(self.selected_components),
+                       "preview": preview, "start_mouse": QPoint(self._last_mouse), "width": 0.01}
+        node["geometry"] = preview
+        self.update()
+
+    def _set_bevel_width(self, width: float) -> None:
+        state, node = self._bevel, self.selected_node
+        if state is None or node is None or node["id"] != state["node_id"]:
+            return
+        width = max(0.0, float(width))
+        if width <= 1e-6:
+            node["geometry"] = deepcopy(state["before"])
+            state["width"] = 0.0
+            self.update()
+            return
+        try:
+            state["preview"] = bevel_geometry(state["before"], state["edge_ids"], width)
+        except MeshTopologyError:
+            return
+        state["width"] = width
+        node["geometry"] = deepcopy(state["preview"])
+        self.update()
+
+    def _finish_operation(self, kind: str) -> None:
+        state = getattr(self, f"_{kind}")
+        if state is None:
+            return
+        node = next((candidate for candidate in self.nodes if candidate.get("id") == state["node_id"]), None)
+        setattr(self, f"_{kind}", None)
+        self._operation_dragging = False
+        if node is not None and state.get("width", state.get("fraction", 0.0)) > 0:
+            node["geometry"] = state["preview"]
+            self.selected_components.clear()
+            self._push_edit_history(state["node_id"], "geometry", state["before"])
+            self.sceneChanged.emit()
+        elif node is not None:
+            node["geometry"] = state["before"]
+        self.update()
+
+    def _cancel_operation(self, kind: str) -> None:
+        state = getattr(self, f"_{kind}")
+        if state is None:
+            return
+        node = next((candidate for candidate in self.nodes if candidate.get("id") == state["node_id"]), None)
+        setattr(self, f"_{kind}", None)
+        self._operation_dragging = False
+        if node is not None:
+            node["geometry"] = state["before"]
         self.update()
 
     def inset_selected_face(self) -> None:
@@ -695,15 +805,18 @@ class SceneViewport(QOpenGLWidget):
         if self.mode == "object":
             glDisable(GL_LIGHTING)
             glPushMatrix()
-            glMultMatrixf(np.asarray(node_matrix(node).T, dtype=np.float32))
+            matrix = node_matrix(node)
+            glMultMatrixf(np.asarray(matrix.T, dtype=np.float32))
             glColor3f(0.82, 1.0, 0.31)
             glLineWidth(1.5)
             glBegin(GL_LINES)
-            for triangle in triangles:
-                for start, end in ((triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0])):
-                    for index in (start, end):
-                        point = vertices[index]
-                        glVertex3f(float(point[0]), float(point[1]), float(point[2]))
+            _, eye, _, _ = self.camera.view_matrix()
+            eye_local = (np.linalg.inv(matrix) @ np.append(eye, 1.0))[:3]
+            edges = geometry.get("edges", [])
+            for edge_id in _silhouette_edge_ids(geometry, eye_local):
+                for index in edges[edge_id]:
+                    point = vertices[index]
+                    glVertex3f(float(point[0]), float(point[1]), float(point[2]))
             glEnd()
             glPopMatrix()
         if self.mode == "edit" and node.get("id") == self.selected_id:
@@ -908,6 +1021,13 @@ class SceneViewport(QOpenGLWidget):
         self.setFocus()
         self._last_mouse = event.position().toPoint()
         self._drag_start = self._last_mouse
+        if self._loop_cut is not None or self._bevel is not None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._operation_dragging = True
+            elif event.button() == Qt.MouseButton.RightButton:
+                self._cancel_operation("loop_cut" if self._loop_cut is not None else "bevel")
+            event.accept()
+            return
         if self._extrusion is not None:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._extrusion_dragging = True
@@ -1000,7 +1120,12 @@ class SceneViewport(QOpenGLWidget):
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
         point = event.position().toPoint()
         delta = point - self._last_mouse
-        if self._extrusion is not None:
+        if self._loop_cut is not None and self._operation_dragging:
+            self._set_loop_fraction(0.5 + (point.x() - self._loop_cut["start_mouse"].x()) / 160.0)
+        elif self._bevel is not None and self._operation_dragging:
+            delta = abs(point.x() - self._bevel["start_mouse"].x())
+            self._set_bevel_width(delta * self.camera.distance / max(self.height(), 1))
+        elif self._extrusion is not None:
             self._update_extrusion(point)
         elif self._inset is not None:
             self._update_inset(point)
@@ -1062,6 +1187,14 @@ class SceneViewport(QOpenGLWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._loop_cut is not None and self._operation_dragging:
+            self._finish_operation("loop_cut")
+            event.accept()
+            return
+        if self._bevel is not None and self._operation_dragging:
+            self._finish_operation("bevel")
+            event.accept()
+            return
         if self._extrusion is not None and self._extrusion_dragging:
             self._finish_extrusion()
             event.accept()
@@ -1088,6 +1221,14 @@ class SceneViewport(QOpenGLWidget):
         event.accept()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if (self._loop_cut is not None or self._bevel is not None) and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._finish_operation("loop_cut" if self._loop_cut is not None else "bevel")
+            event.accept()
+            return
+        if (self._loop_cut is not None or self._bevel is not None) and event.key() == Qt.Key.Key_Escape:
+            self._cancel_operation("loop_cut" if self._loop_cut is not None else "bevel")
+            event.accept()
+            return
         if self._inset is not None and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._finish_inset()
             event.accept()
@@ -1126,6 +1267,14 @@ class SceneViewport(QOpenGLWidget):
             return
         if self.mode == "edit" and event.key() == Qt.Key.Key_I:
             self.inset_selected_face()
+            event.accept()
+            return
+        if self.mode == "edit" and event.key() == Qt.Key.Key_L:
+            self.loop_cut_selected_edge()
+            event.accept()
+            return
+        if self.mode == "edit" and event.key() == Qt.Key.Key_B:
+            self.bevel_selected_edges()
             event.accept()
             return
         if event.key() == Qt.Key.Key_Escape and self._dragging_transform and self._drag_transform is not None:

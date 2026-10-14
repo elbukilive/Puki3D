@@ -13,7 +13,9 @@ from puki3d.scene import (
     _geometry,
     create_node,
     ensure_editable_geometry,
+    bevel_geometry,
     inset_face_geometry,
+    loop_cut_geometry,
     mirrored_geometry,
     node_matrix,
     primitive_geometry,
@@ -124,6 +126,63 @@ class SceneTests(unittest.TestCase):
     def test_inset_rejects_a_distance_that_collapses_the_face(self) -> None:
         with self.assertRaises(MeshTopologyError):
             inset_face_geometry(primitive_geometry("cube"), 1, 0.5)
+
+    def test_loop_cut_splits_a_closed_quad_loop_and_rebuilds_topology(self) -> None:
+        cut = loop_cut_geometry(primitive_geometry("cube"), 0, 0.35)
+        self.assertEqual((len(cut["vertices"]), len(cut["edges"]), len(cut["faces"])), (12, 20, 10))
+        self.assertEqual(len(cut["triangles"]), 20)
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in cut["edge_faces"]))
+
+    def test_loop_cut_stops_safely_at_triangles_or_boundaries(self) -> None:
+        with self.assertRaises(MeshTopologyError):
+            loop_cut_geometry(primitive_geometry("cylinder"), 1)
+        with self.assertRaises(MeshTopologyError):
+            loop_cut_geometry(primitive_geometry("plane"), 0)
+        beveled = bevel_geometry(primitive_geometry("cube"), [0], 0.1)
+        original = [list(face) for face in beveled["faces"]]
+        with self.assertRaises(MeshTopologyError):
+            loop_cut_geometry(beveled, 1)
+        self.assertEqual(beveled["faces"], original)
+
+    def test_bevel_clips_a_convex_cube_edge_without_open_boundaries(self) -> None:
+        bevel = bevel_geometry(primitive_geometry("cube"), [0], 0.1)
+        self.assertEqual(len(bevel["faces"]), 7)
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in bevel["edge_faces"]))
+        self.assertEqual(len(bevel["face_normals"]), len(bevel["faces"]))
+
+    def test_bevel_handles_multiple_adjacent_edges_as_a_closed_surface(self) -> None:
+        bevel = bevel_geometry(primitive_geometry("cube"), [0, 3], 0.08)
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in bevel["edge_faces"]))
+        self.assertGreater(len(bevel["faces"]), 6)
+
+    def test_loop_cut_bevel_and_mirror_keep_a_closed_symmetric_surface(self) -> None:
+        half = _geometry(
+            [[0, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0, 0.5, -0.5],
+             [0, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [0, 0.5, 0.5]],
+            [[0, 3, 7, 4], [1, 2, 6, 5], [0, 1, 2, 3], [0, 1, 5, 4], [3, 2, 6, 7], [4, 5, 6, 7]],
+        )
+        cut = loop_cut_geometry(half, 0, 0.35)
+        bevel = bevel_geometry(cut, [0], 0.04)
+        mirrored, _ = mirrored_geometry(bevel, 0)
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in mirrored["edge_faces"]))
+        self.assertTrue(all(len(triangle) == 3 for triangle in mirrored["triangles"]))
+
+    def test_bevel_rejects_open_mesh_and_collapsing_width(self) -> None:
+        with self.assertRaises(MeshTopologyError):
+            bevel_geometry(primitive_geometry("plane"), [0], 0.1)
+        with self.assertRaises(MeshTopologyError):
+            bevel_geometry(primitive_geometry("cube"), [0], 1.0)
+
+    def test_bevel_tracks_concave_cut_contours_without_opening_mesh(self) -> None:
+        outline = [[0, 0], [2, 0], [2, 1], [1, 1], [1, 2], [0, 2]]
+        vertices = [[x, y, z] for z in (-0.5, 0.5) for x, y in outline]
+        count = len(outline)
+        faces = [list(reversed(range(count))), list(range(count, count * 2))]
+        faces.extend([[i, (i + 1) % count, (i + 1) % count + count, i + count] for i in range(count)])
+        concave = _geometry(vertices, faces)
+        bevel = bevel_geometry(concave, [0], 0.05)
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in bevel["edge_faces"]))
+        self.assertEqual(len(bevel["triangles"]), sum(len(face) - 2 for face in bevel["faces"]))
 
     def test_mirror_welds_the_center_seam_and_reverses_winding(self) -> None:
         half = _geometry(
