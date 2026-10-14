@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from .project import PROJECT_EXTENSION, PROJECT_TYPES, Project, ProjectError
-from .scene import PRIMITIVES, create_node
+from .scene import MeshTopologyError, PRIMITIVES, create_node
 from .viewport import SceneViewport
 
 
@@ -375,6 +375,25 @@ class MainWindow(QMainWindow):
         redo_button.setToolTip("Rehacer edición (Ctrl+Y)")
         redo_button.clicked.connect(lambda: self.viewport.redo_edit())
         canvas_toolbar.addWidget(redo_button)
+        self.inset_button = QPushButton("Inset (I)")
+        self.inset_button.setToolTip("Crear un borde interior en la cara seleccionada")
+        self.inset_button.setEnabled(False)
+        self.inset_button.clicked.connect(lambda: self.viewport.inset_selected_face())
+        canvas_toolbar.addWidget(self.inset_button)
+        mirror_button = QToolButton()
+        mirror_button.setText("Mirror")
+        mirror_button.setToolTip("Activar o desactivar simetría sobre X, Y o Z")
+        mirror_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        mirror_menu = QMenu(mirror_button)
+        self.mirror_axis_actions = {}
+        for axis_index, axis in enumerate("XYZ"):
+            action = QAction(f"Mirror {axis}", self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked=False, value=axis_index: self._toggle_mirror_axis(value))
+            mirror_menu.addAction(action)
+            self.mirror_axis_actions[axis_index] = action
+        mirror_button.setMenu(mirror_menu)
+        canvas_toolbar.addWidget(mirror_button)
         canvas_toolbar.addStretch()
         view_mode = QLabel("Perspectiva  ·  3D")
         view_mode.setObjectName("muted")
@@ -386,6 +405,7 @@ class MainWindow(QMainWindow):
         self.viewport.sceneChanged.connect(self._mark_project_dirty)
         self.viewport.modeChanged.connect(self._on_viewport_mode_changed)
         self.viewport.extrusionStateChanged.connect(self._on_extrusion_state_changed)
+        self.viewport.insetStateChanged.connect(self._on_inset_state_changed)
         canvas_layout.addWidget(self.viewport, 1)
         status = QHBoxLayout()
         status_label = QLabel("ESCENA PRINCIPAL")
@@ -395,7 +415,6 @@ class MainWindow(QMainWindow):
         status.addStretch()
         status.addWidget(QLabel("Unidades: metros"))
         canvas_layout.addLayout(status)
-        self._on_viewport_mode_changed(self.viewport.mode, self.viewport.component_mode)
         body.addWidget(canvas_area, 1)
 
         inspector = QFrame()
@@ -486,6 +505,11 @@ class MainWindow(QMainWindow):
             self.transform_fields[key] = fields
         inspector_layout.addWidget(self.transform_panel)
         self.transform_panel.setEnabled(False)
+        self.mirror_hint = QLabel("ESPEJO: DESACTIVADO")
+        self.mirror_hint.setObjectName("muted")
+        self.mirror_hint.setContentsMargins(16, 0, 8, 10)
+        inspector_layout.addWidget(self.mirror_hint)
+        self._on_viewport_mode_changed(self.viewport.mode, self.viewport.component_mode)
         body.addWidget(inspector)
         layout.addLayout(body, 1)
 
@@ -529,13 +553,42 @@ class MainWindow(QMainWindow):
         for value, button in self.component_buttons.items():
             button.setChecked(value == component)
             button.setEnabled(mode == "edit")
-        if self.viewport.extruding:
-            self.edit_status.setText("EXTRUSIÓN · Mueve el cursor y haz clic o Enter para confirmar · Esc cancela")
+        self.inset_button.setEnabled(mode == "edit" and component == "face" and bool(self.viewport.selected_node))
+        self._sync_mirror_controls(self.viewport.selected_node)
+        if self.viewport.insetting:
+            self.edit_status.setText("INSET ? Arrastra a la derecha para ajustar ? Enter confirma ? Esc cancela")
+        elif self.viewport.extruding:
+            self.edit_status.setText("Extrusi?n ? Mueve el cursor y confirma con Enter ? Esc cancela")
+        elif mode == "edit":
+            mirror = self.viewport.selected_node.get("mirror") if self.viewport.selected_node else None
+            suffix = f" ? MIRROR {'XYZ'[int(mirror['axis'])]}" if mirror else ""
+            self.edit_status.setText("Modo edici?n ? " + {"vertex": "V?rtices", "edge": "Aristas", "face": "Caras"}[component] + suffix)
         else:
-            self.edit_status.setText("MODO EDICIÓN · " + {"vertex": "VÉRTICES", "edge": "ARISTAS", "face": "CARAS"}[component] if mode == "edit" else "ESCENA PRINCIPAL")
+            self.edit_status.setText("ESCENA PRINCIPAL")
 
     def _on_extrusion_state_changed(self, active: bool) -> None:
         self._on_viewport_mode_changed(self.viewport.mode, self.viewport.component_mode)
+
+    def _on_inset_state_changed(self, active: bool) -> None:
+        self._on_viewport_mode_changed(self.viewport.mode, self.viewport.component_mode)
+
+    def _toggle_mirror_axis(self, axis: int) -> None:
+        try:
+            self.viewport.set_mirror_axis(axis)
+        except MeshTopologyError as exc:
+            self.edit_status.setText(str(exc))
+        self._sync_mirror_controls(self.viewport.selected_node)
+        self._on_viewport_mode_changed(self.viewport.mode, self.viewport.component_mode)
+
+    def _sync_mirror_controls(self, node) -> None:
+        mirror = node.get("mirror") if node else None
+        for axis, action in self.mirror_axis_actions.items():
+            action.setEnabled(bool(node) and self.viewport.mode == "edit")
+            action.setChecked(bool(mirror and int(mirror.get("axis", -1)) == axis))
+        if node and mirror:
+            self.mirror_hint.setText(f"ESPEJO ACTIVO ? EJE {'XYZ'[int(mirror['axis'])]}")
+        else:
+            self.mirror_hint.setText("ESPEJO: DESACTIVADO")
 
     def _add_primitive_actions(self, menu: QMenu) -> None:
         for primitive, label in PRIMITIVES.items():
@@ -589,6 +642,7 @@ class MainWindow(QMainWindow):
         self.outliner.setCurrentRow(row)
         self.outliner.blockSignals(False)
         self._update_transform_fields(node)
+        self._on_viewport_mode_changed(self.viewport.mode, self.viewport.component_mode)
 
     def _on_viewport_transform(self, node) -> None:
         self._update_transform_fields(node)

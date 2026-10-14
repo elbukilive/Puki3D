@@ -15,7 +15,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from puki3d.project import Project
-from puki3d.scene import node_matrix
+from puki3d.scene import _geometry, node_matrix
 from puki3d.ui import MainWindow
 
 
@@ -82,6 +82,15 @@ class WorkspaceSyncTests(unittest.TestCase):
         saved_node = reopened.data["scenes"][0]["nodes"][0]
         self.assertEqual(saved_node["geometry"], node["geometry"])
 
+    def test_select_all_components_shortcut_tracks_active_mode(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        viewport.set_mode("edit")
+        for mode, count in (("vertex", 8), ("edge", 12), ("face", 6)):
+            viewport.set_component_mode(mode)
+            QTest.keyClick(viewport, Qt.Key.Key_A)
+            self.assertEqual(viewport.selected_components, set(range(count)))
+
     def test_escape_cancels_active_extrusion_without_changing_mesh(self) -> None:
         self.window.add_primitive("cube")
         viewport = self.window.viewport
@@ -98,6 +107,58 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(node["geometry"], original)
         self.assertFalse(viewport._undo_stack)
 
+    def test_inset_preview_commits_undoes_redoes_and_persists(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        viewport.set_mode("edit")
+        viewport.set_component_mode("face")
+        viewport.selected_components = {1}
+        original = copy.deepcopy(node["geometry"])
+        screen = viewport._project([0.0, 0.0, 1.0])
+        viewport._last_mouse = QPoint(round(screen[0]), round(screen[1]))
+        viewport.inset_selected_face()
+        self.assertTrue(viewport.insetting)
+        viewport._update_inset(viewport._last_mouse + QPoint(8, 0))
+        self.assertGreater(viewport._inset["amount"], 0.0)
+        viewport._finish_inset()
+        self.assertFalse(viewport.insetting)
+        self.assertEqual(len(node["geometry"]["faces"]), 10)
+        viewport.undo_edit()
+        self.assertEqual(node["geometry"], original)
+        viewport.redo_edit()
+        self.assertEqual(len(node["geometry"]["vertices"]), 12)
+
+        self.window.save_project()
+        reopened = Project.load(self.project.path)
+        self.assertEqual(reopened.data["scenes"][0]["nodes"][0]["geometry"], node["geometry"])
+
+    def test_mirror_modifier_is_welded_toggleable_undoable_and_persistent(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        viewport.set_mode("edit")
+        node["geometry"] = _geometry(
+            [[0, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0, 0.5, -0.5],
+             [0, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [0, 0.5, 0.5]],
+            [[0, 3, 7, 4], [1, 2, 6, 5], [0, 1, 2, 3], [0, 1, 5, 4], [3, 2, 6, 7], [4, 5, 6, 7]],
+        )
+        viewport.set_mirror_axis(0)
+        self.assertEqual(node["mirror"], {"axis": 0, "merge": True, "clip": True})
+        evaluated, maps = viewport._evaluated_geometry(node)
+        self.assertEqual(len(evaluated["vertices"]), 12)
+        self.assertEqual(len(evaluated["faces"]), 10)
+        self.assertTrue(all(index >= 0 for index in maps["edges"]))
+        viewport.undo_edit()
+        self.assertNotIn("mirror", node)
+        viewport.redo_edit()
+        self.assertEqual(node["mirror"]["axis"], 0)
+        self.window.save_project()
+        reopened = Project.load(self.project.path)
+        loaded = reopened.data["scenes"][0]["nodes"][0]
+        self.assertEqual(loaded["mirror"], node["mirror"])
+        self.assertEqual(loaded["geometry"], node["geometry"])
+
     def test_edit_face_picking_uses_the_face_under_the_cursor(self) -> None:
         self.window.add_primitive("cube")
         viewport = self.window.viewport
@@ -106,6 +167,27 @@ class WorkspaceSyncTests(unittest.TestCase):
         screen = viewport._project([0.0, 0.0, 1.0])
         picked = viewport._pick_component(QPoint(round(screen[0]), round(screen[1])))
         self.assertEqual(picked, 1)
+
+    def test_mirrored_face_can_be_picked_and_selects_source_face(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        node["geometry"]["vertices"] = [
+            [vertex[0] + 0.5, vertex[1], vertex[2]]
+            for vertex in node["geometry"]["vertices"]
+        ]
+        viewport.set_mode("edit")
+        viewport.set_mirror_axis(0)
+        viewport.set_component_mode("face")
+        face = node["geometry"]["faces"][1]
+        center = np.mean(np.asarray(node["geometry"]["vertices"])[face], axis=0)
+        world = (node_matrix(node) @ np.append(center, 1.0))[:3]
+        screen = viewport._project(world)
+        point = QPoint(round(screen[0]), round(screen[1]))
+
+        self.assertEqual(viewport._pick_component(point), 1)
+        QTest.mouseClick(viewport, Qt.MouseButton.LeftButton, pos=point)
+        self.assertEqual(viewport.selected_components, {1})
 
     def test_vertex_edge_and_face_picking_use_visible_mesh_elements(self) -> None:
         self.window.add_primitive("cube")

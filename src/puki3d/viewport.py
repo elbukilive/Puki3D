@@ -28,7 +28,15 @@ from .camera import (
     ray_axis_parameter,
     signed_angle_about_axis,
 )
-from .scene import ensure_editable_geometry, node_matrix, raycast
+from .scene import (
+    MeshTopologyError,
+    _triangulate_face,
+    ensure_editable_geometry,
+    inset_face_geometry,
+    mirrored_geometry,
+    node_matrix,
+    raycast,
+)
 
 
 class SceneViewport(QOpenGLWidget):
@@ -37,6 +45,7 @@ class SceneViewport(QOpenGLWidget):
     sceneChanged = Signal()
     modeChanged = Signal(str, str)
     extrusionStateChanged = Signal(bool)
+    insetStateChanged = Signal(bool)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -48,8 +57,8 @@ class SceneViewport(QOpenGLWidget):
         self.mode = "object"
         self.component_mode = "face"
         self.selected_components: set[int] = set()
-        self._undo_stack: list[tuple[str, dict]] = []
-        self._redo_stack: list[tuple[str, dict]] = []
+        self._undo_stack: list[tuple[str, str, object]] = []
+        self._redo_stack: list[tuple[str, str, object]] = []
         self.tool = "select"
         self.camera = OrbitCamera()
         self._last_mouse = QPoint()
@@ -60,6 +69,8 @@ class SceneViewport(QOpenGLWidget):
         self._drag_pivot_world: np.ndarray | None = None
         self._extrusion: dict | None = None
         self._extrusion_dragging = False
+        self._inset: dict | None = None
+        self._inset_dragging = False
         self._dragging_transform = False
         self._drag_axis: int | None = None
         self._drag_axis_start: float | None = None
@@ -113,7 +124,22 @@ class SceneViewport(QOpenGLWidget):
         self.modeChanged.emit(self.mode, self.component_mode)
         self.update()
 
+    def select_all_components(self) -> None:
+        node = self.selected_node
+        if self.mode != "edit" or node is None:
+            return
+        geometry, source_maps = self._evaluated_geometry(node)
+        if self.component_mode == "vertex":
+            self.selected_components = set(source_maps["vertices"])
+        elif self.component_mode == "edge":
+            self.selected_components = set(source_maps["edges"])
+        else:
+            self.selected_components = set(source_maps["faces"])
+        self.update()
+
     def _component_edges(self, geometry: dict) -> list[tuple[int, int]]:
+        if "edges" in geometry:
+            return [tuple(edge) for edge in geometry["edges"]]
         edges = set()
         for face in geometry.get("faces", []):
             for start, end in zip(face, face[1:] + face[:1]):
@@ -144,39 +170,155 @@ class SceneViewport(QOpenGLWidget):
         import copy
         return copy.deepcopy(node.get("geometry", {}))
 
+    def _push_edit_history(self, node_id: str, kind: str, value: object) -> None:
+        self._undo_stack.append((node_id, kind, deepcopy(value)))
+        self._undo_stack = self._undo_stack[-100:]
+        self._redo_stack.clear()
+
     def _record_geometry_change(self, before: dict | None) -> None:
         if before is None or self.selected_node is None:
             return
         after = self._snapshot_geometry()
         if before != after:
-            self._undo_stack.append((self.selected_id, before))
-            self._undo_stack = self._undo_stack[-100:]
-            self._redo_stack.clear()
+            self._push_edit_history(self.selected_id, "geometry", before)
+            self.sceneChanged.emit()
+
+    def _record_mirror_change(self, node: dict, before: dict | None) -> None:
+        if before != node.get("mirror"):
+            self._push_edit_history(node["id"], "mirror", before)
             self.sceneChanged.emit()
 
     def undo_edit(self) -> None:
         if not self._undo_stack:
             return
-        node_id, geometry = self._undo_stack.pop()
+        node_id, kind, value = self._undo_stack.pop()
         node = next((candidate for candidate in self.nodes if candidate.get("id") == node_id), None)
         if node is None:
             return
-        self._redo_stack.append((node_id, node.get("geometry", {})))
-        node["geometry"] = geometry
+        current = deepcopy(node.get(kind))
+        self._redo_stack.append((node_id, kind, current))
+        if kind == "mirror" and value is None:
+            node.pop("mirror", None)
+        else:
+            node[kind] = value
         self.update()
         self.sceneChanged.emit()
 
     def redo_edit(self) -> None:
         if not self._redo_stack:
             return
-        node_id, geometry = self._redo_stack.pop()
+        node_id, kind, value = self._redo_stack.pop()
         node = next((candidate for candidate in self.nodes if candidate.get("id") == node_id), None)
         if node is None:
             return
-        self._undo_stack.append((node_id, node.get("geometry", {})))
-        node["geometry"] = geometry
+        current = deepcopy(node.get(kind))
+        self._undo_stack.append((node_id, kind, current))
+        if kind == "mirror" and value is None:
+            node.pop("mirror", None)
+        else:
+            node[kind] = value
         self.update()
         self.sceneChanged.emit()
+
+    def _evaluated_geometry(self, node: dict) -> tuple[dict, dict]:
+        source = ensure_editable_geometry(node.setdefault("geometry", {}))
+        mirror = node.get("mirror")
+        if mirror is None:
+            return source, {
+                "vertices": list(range(len(source["vertices"]))),
+                "edges": list(range(len(source["edges"]))),
+                "faces": list(range(len(source["faces"]))),
+            }
+        return mirrored_geometry(source, int(mirror["axis"]))
+
+    def set_mirror_axis(self, axis: int | None) -> None:
+        node = self.selected_node
+        if node is None or self.mode != "edit":
+            return
+        before = deepcopy(node.get("mirror"))
+        if axis is None or (node.get("mirror") and int(node["mirror"].get("axis", -1)) == axis):
+            node.pop("mirror", None)
+        else:
+            mirrored_geometry(node.get("geometry", {}), int(axis))
+            node["mirror"] = {"axis": int(axis), "merge": True, "clip": True}
+        self._record_mirror_change(node, before)
+        self.update()
+
+    def inset_selected_face(self) -> None:
+        node = self.selected_node
+        if self._inset is not None or self._extrusion is not None:
+            return
+        if self.mode != "edit" or self.component_mode != "face" or node is None or len(self.selected_components) != 1:
+            return
+        face_id = next(iter(self.selected_components))
+        baseline = self._snapshot_geometry()
+        try:
+            inset_face_geometry(baseline, face_id, 0.001)
+        except MeshTopologyError:
+            return
+        self._inset = {
+            "node_id": node["id"],
+            "before": baseline,
+            "face_id": face_id,
+            "start_mouse": QPoint(self._last_mouse),
+            "amount": 0.0,
+        }
+        self._inset_dragging = False
+        self.insetStateChanged.emit(True)
+        self.update()
+
+    @property
+    def insetting(self) -> bool:
+        return self._inset is not None
+
+    def _set_inset_amount(self, amount: float) -> None:
+        state = self._inset
+        node = self.selected_node
+        if state is None or node is None or node.get("id") != state["node_id"]:
+            return
+        amount = max(0.0, float(amount))
+        if amount <= 1e-6:
+            node["geometry"] = deepcopy(state["before"])
+            state["amount"] = 0.0
+            self.update()
+            return
+        try:
+            node["geometry"] = inset_face_geometry(state["before"], state["face_id"], amount)
+        except MeshTopologyError:
+            return
+        state["amount"] = amount
+        self.update()
+
+    def _update_inset(self, point: QPoint) -> None:
+        state = self._inset
+        if state is None:
+            return
+        amount = (point.x() - state["start_mouse"].x()) * self.camera.distance / max(self.height(), 1)
+        self._set_inset_amount(amount)
+
+    def _finish_inset(self) -> None:
+        state = self._inset
+        if state is None:
+            return
+        self._inset = None
+        self._inset_dragging = False
+        self.insetStateChanged.emit(False)
+        if state["amount"] > 1e-6:
+            self._push_edit_history(state["node_id"], "geometry", state["before"])
+            self.sceneChanged.emit()
+        self.update()
+
+    def _cancel_inset(self) -> None:
+        state = self._inset
+        if state is None:
+            return
+        node = next((candidate for candidate in self.nodes if candidate.get("id") == state["node_id"]), None)
+        self._inset = None
+        self._inset_dragging = False
+        if node is not None:
+            node["geometry"] = state["before"]
+        self.insetStateChanged.emit(False)
+        self.update()
 
     def delete_selected_components(self) -> None:
         node = self.selected_node
@@ -276,6 +418,11 @@ class SceneViewport(QOpenGLWidget):
         if state is None or node is None or node.get("id") != state["node_id"]:
             return
         distance = float(np.clip(distance, -100.0, 100.0))
+        if abs(distance) <= 1e-6:
+            node["geometry"] = deepcopy(state["before"])
+            state["distance"] = 0.0
+            self.update()
+            return
         baseline_vertices = state["vertices"]
         geometry_vertices = [list(vertex) for vertex in baseline_vertices[:len(state["vertices"]) - len(state["new_face"])]]
         matrix = node_matrix(node)
@@ -320,9 +467,7 @@ class SceneViewport(QOpenGLWidget):
                 node["geometry"] = before
             self.update()
             return
-        self._undo_stack.append((state["node_id"], before))
-        self._undo_stack = self._undo_stack[-100:]
-        self._redo_stack.clear()
+        self._push_edit_history(state["node_id"], "geometry", before)
         self.sceneChanged.emit()
 
     def _cancel_extrusion(self) -> None:
@@ -341,12 +486,21 @@ class SceneViewport(QOpenGLWidget):
         node = self.selected_node
         if node is None:
             return None
-        geometry = ensure_editable_geometry(node.setdefault("geometry", {}))
+        source = ensure_editable_geometry(node.setdefault("geometry", {}))
+        try:
+            geometry, maps = self._evaluated_geometry(node)
+        except MeshTopologyError:
+            geometry = source
+            maps = {
+                "vertices": list(range(len(source["vertices"]))),
+                "edges": list(range(len(source["edges"]))),
+                "faces": list(range(len(source["faces"]))),
+            }
         vertices = geometry["vertices"]
         mouse = np.array([point.x(), point.y()], dtype=float)
         if self.component_mode == "vertex":
-            projected = [(index, self._project((node_matrix(node) @ np.append(vertex, 1.0))[:3])) for index, vertex in enumerate(vertices)]
-            values = [(index, float(np.linalg.norm(screen - mouse))) for index, screen in projected if screen is not None]
+            projected = [(maps["vertices"][index], self._project((node_matrix(node) @ np.append(vertex, 1.0))[:3])) for index, vertex in enumerate(vertices)]
+            values = [(source_id, float(np.linalg.norm(screen - mouse))) for source_id, screen in projected if screen is not None]
             if values and min(values, key=lambda item: item[1])[1] <= 14:
                 return min(values, key=lambda item: item[1])[0]
         elif self.component_mode == "edge":
@@ -357,7 +511,7 @@ class SceneViewport(QOpenGLWidget):
                 if a is not None and b is not None:
                     distance, _ = closest_segment_fraction(mouse, a, b)
                     if distance < best[1]:
-                        best = (edge_id, distance)
+                        best = (maps["edges"][edge_id], distance)
             return best[0]
         else:
             ray_origin, ray_direction = self._ray_for_point(point)
@@ -366,8 +520,8 @@ class SceneViewport(QOpenGLWidget):
             local_direction = (inverse @ np.append(ray_direction, 0.0))[:3]
             closest, face_hit = float("inf"), None
             for face_id, face in enumerate(geometry.get("faces", [])):
-                for offset in range(1, len(face) - 1):
-                    a, b, c = (np.asarray(vertices[index], dtype=float) for index in (face[0], face[offset], face[offset + 1]))
+                for triangle in _triangulate_face(vertices, face):
+                    a, b, c = (np.asarray(vertices[index], dtype=float) for index in triangle)
                     edge1, edge2 = b - a, c - a
                     h = np.cross(local_direction, edge2)
                     determinant = float(np.dot(edge1, h))
@@ -380,7 +534,7 @@ class SceneViewport(QOpenGLWidget):
                     v = inverse_det * float(np.dot(local_direction, q))
                     distance = inverse_det * float(np.dot(edge2, q))
                     if u >= 0 and v >= 0 and u + v <= 1 and distance > 0 and distance < closest:
-                        closest, face_hit = distance, face_id
+                        closest, face_hit = distance, maps["faces"][face_id]
             return face_hit
         return None
 
@@ -423,6 +577,14 @@ class SceneViewport(QOpenGLWidget):
             else:
                 world = pivot_world + transform @ (world - pivot_world)
             geometry["vertices"][index] = (inverse @ np.append(world, 1.0))[:3].tolist()
+        mirror = node.get("mirror")
+        if mirror and mirror.get("clip", True):
+            mirror_axis = int(mirror["axis"])
+            for index, original in enumerate(baseline):
+                source_side = float(original[mirror_axis])
+                moved_side = float(geometry["vertices"][index][mirror_axis])
+                if abs(source_side) <= 1e-6 or source_side * moved_side < 0:
+                    geometry["vertices"][index][mirror_axis] = 0.0
         self.update()
 
     def focus_selected(self) -> None:
@@ -496,7 +658,10 @@ class SceneViewport(QOpenGLWidget):
             "cylinder": (0.58, 0.65, 0.72), "plane": (0.45, 0.50, 0.57),
         }
         for node in self.nodes:
-            geometry = node.get("geometry", {})
+            try:
+                geometry, _ = self._evaluated_geometry(node)
+            except MeshTopologyError:
+                geometry = node.get("geometry", {})
             vertices = geometry.get("vertices", [])
             triangles = geometry.get("triangles", [])
             if not vertices or not triangles:
@@ -519,7 +684,10 @@ class SceneViewport(QOpenGLWidget):
             glPopMatrix()
 
     def _draw_selection(self, node: dict, camera_right: np.ndarray, camera_up: np.ndarray) -> None:
-        geometry = node.get("geometry", {})
+        try:
+            geometry, _ = self._evaluated_geometry(node)
+        except MeshTopologyError:
+            geometry = node.get("geometry", {})
         vertices = geometry.get("vertices", [])
         triangles = geometry.get("triangles", [])
         if not vertices or not triangles:
@@ -549,7 +717,16 @@ class SceneViewport(QOpenGLWidget):
         glEnable(GL_LIGHTING)
 
     def _draw_edit_components(self, node: dict) -> None:
-        geometry = ensure_editable_geometry(node.setdefault("geometry", {}))
+        source = ensure_editable_geometry(node.setdefault("geometry", {}))
+        try:
+            geometry, maps = self._evaluated_geometry(node)
+        except MeshTopologyError:
+            geometry = source
+            maps = {
+                "vertices": list(range(len(source["vertices"]))),
+                "edges": list(range(len(source["edges"]))),
+                "faces": list(range(len(source["faces"]))),
+            }
         vertices, faces = geometry["vertices"], geometry["faces"]
         matrix = node_matrix(node)
         glDisable(GL_LIGHTING)
@@ -559,7 +736,8 @@ class SceneViewport(QOpenGLWidget):
         glBegin(GL_LINES)
         edge_ids = self._component_edges(geometry)
         for edge_id, (start, end) in enumerate(edge_ids):
-            selected = edge_id in self.selected_components if self.component_mode == "edge" else False
+            source_edge = maps["edges"][edge_id]
+            selected = source_edge in self.selected_components if self.component_mode == "edge" else False
             glColor3f(*( (1.0, 0.95, 0.30) if selected else (0.10, 0.12, 0.15) ))
             for index in (start, end):
                 glVertex3f(*map(float, vertices[index]))
@@ -568,9 +746,8 @@ class SceneViewport(QOpenGLWidget):
             glColor3f(1.0, 0.88, 0.24)
             glLineWidth(3.0)
             glBegin(GL_LINES)
-            for face_id in self.selected_components:
-                if face_id < len(faces):
-                    face = faces[face_id]
+            for face_id, face in enumerate(faces):
+                if maps["faces"][face_id] in self.selected_components:
                     for start, end in zip(face, face[1:] + face[:1]):
                         glVertex3f(*map(float, vertices[start]))
                         glVertex3f(*map(float, vertices[end]))
@@ -578,10 +755,11 @@ class SceneViewport(QOpenGLWidget):
         glPointSize(9.0)
         glBegin(GL_POINTS)
         for vertex_id, vertex in enumerate(vertices):
+            source_vertex = maps["vertices"][vertex_id]
             if self.component_mode == "vertex":
-                selected = vertex_id in self.selected_components
+                selected = source_vertex in self.selected_components
             else:
-                selected = vertex_id in self._selected_vertex_indices(geometry)
+                selected = source_vertex in self._selected_vertex_indices(source)
             glColor3f(*( (1.0, 0.93, 0.24) if selected else (0.20, 0.76, 1.0) ))
             glVertex3f(*map(float, vertex))
         glEnd()
@@ -713,7 +891,14 @@ class SceneViewport(QOpenGLWidget):
 
     def _pick(self, point: QPoint) -> str | None:
         origin, direction = self._ray_for_point(point)
-        return raycast(self.nodes, origin, direction)
+        evaluated_nodes = []
+        for node in self.nodes:
+            try:
+                geometry, _ = self._evaluated_geometry(node)
+            except MeshTopologyError:
+                geometry = node.get("geometry", {})
+            evaluated_nodes.append({**node, "geometry": geometry})
+        return raycast(evaluated_nodes, origin, direction)
 
     def _camera_basis(self) -> tuple[np.ndarray, np.ndarray]:
         view, _, right, camera_up = self.camera.view_matrix()
@@ -728,6 +913,13 @@ class SceneViewport(QOpenGLWidget):
                 self._extrusion_dragging = True
             elif event.button() == Qt.MouseButton.RightButton:
                 self._cancel_extrusion()
+            event.accept()
+            return
+        if self._inset is not None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._inset_dragging = True
+            elif event.button() == Qt.MouseButton.RightButton:
+                self._cancel_inset()
             event.accept()
             return
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -810,6 +1002,8 @@ class SceneViewport(QOpenGLWidget):
         delta = point - self._last_mouse
         if self._extrusion is not None:
             self._update_extrusion(point)
+        elif self._inset is not None:
+            self._update_inset(point)
         elif self._orbiting:
             self.camera.orbit(delta.x(), delta.y())
             self._hover_axis = self._pick_gizmo_axis(point)
@@ -872,6 +1066,10 @@ class SceneViewport(QOpenGLWidget):
             self._finish_extrusion()
             event.accept()
             return
+        if self._inset is not None and self._inset_dragging:
+            self._finish_inset()
+            event.accept()
+            return
         if self._dragging_transform:
             geometry_edit = self.mode == "edit" and self._drag_geometry_before is not None
             if geometry_edit:
@@ -890,6 +1088,14 @@ class SceneViewport(QOpenGLWidget):
         event.accept()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._inset is not None and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._finish_inset()
+            event.accept()
+            return
+        if self._inset is not None and event.key() == Qt.Key.Key_Escape:
+            self._cancel_inset()
+            event.accept()
+            return
         if self._extrusion is not None and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._finish_extrusion()
             event.accept()
@@ -906,12 +1112,20 @@ class SceneViewport(QOpenGLWidget):
             self.set_mode("edit" if self.mode == "object" else "object")
             event.accept()
             return
+        if self.mode == "edit" and event.key() == Qt.Key.Key_A:
+            self.select_all_components()
+            event.accept()
+            return
         if self.mode == "edit" and event.key() in (Qt.Key.Key_1, Qt.Key.Key_2, Qt.Key.Key_3):
             self.set_component_mode({Qt.Key.Key_1: "vertex", Qt.Key.Key_2: "edge", Qt.Key.Key_3: "face"}[event.key()])
             event.accept()
             return
         if self.mode == "edit" and event.key() == Qt.Key.Key_E:
             self.extrude_selected_face()
+            event.accept()
+            return
+        if self.mode == "edit" and event.key() == Qt.Key.Key_I:
+            self.inset_selected_face()
             event.accept()
             return
         if event.key() == Qt.Key.Key_Escape and self._dragging_transform and self._drag_transform is not None:
