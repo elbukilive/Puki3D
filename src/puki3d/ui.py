@@ -41,6 +41,7 @@ from .scene import MeshTopologyError, PRIMITIVES, create_node, ensure_editable_g
 from .viewport import SceneViewport
 from .vehicle_ui import VehicleSystemDialog
 from .vehicle_preview import VehiclePreviewDialog
+from .materials import MaterialEditorDialog, ensure_material_library
 
 
 BACKGROUND = "#101114"
@@ -145,6 +146,10 @@ class MainWindow(QMainWindow):
         preview_action.triggered.connect(self.open_vehicle_preview)
         project_menu.addAction(preview_action)
         self.vehicle_preview_action = preview_action
+        materials_action = QAction("Biblioteca de materiales…", self)
+        materials_action.triggered.connect(self.open_material_editor)
+        project_menu.addAction(materials_action)
+        self.materials_action = materials_action
         project_menu.addSeparator()
         close_action = QAction("Cerrar proyecto", self)
         close_action.setShortcut("Ctrl+W")
@@ -469,6 +474,7 @@ class MainWindow(QMainWindow):
         canvas_layout.addLayout(canvas_toolbar)
         self.viewport = SceneViewport()
         self.viewport.selectionChanged.connect(self._on_viewport_selection)
+        self.viewport.componentSelectionChanged.connect(lambda _selected: self._refresh_material_controls(self.viewport.selected_node))
         self.viewport.transformChanged.connect(self._on_viewport_transform)
         self.viewport.sceneChanged.connect(self._mark_project_dirty)
         self.viewport.modeChanged.connect(self._on_viewport_mode_changed)
@@ -563,6 +569,20 @@ class MainWindow(QMainWindow):
         self.display_color_button.clicked.connect(self.choose_display_color)
         hint_row.addWidget(self.display_color_button)
         inspector_layout.addLayout(hint_row)
+        material_row = QHBoxLayout()
+        material_row.setContentsMargins(14, 0, 10, 4)
+        self.material_combo = QComboBox()
+        self.material_combo.setToolTip("Material compartido del objeto")
+        self.material_combo.currentIndexChanged.connect(self._assign_node_material)
+        material_row.addWidget(self.material_combo, 1)
+        self.material_edit_button = QPushButton("Editar")
+        self.material_edit_button.clicked.connect(self.open_material_editor)
+        material_row.addWidget(self.material_edit_button)
+        inspector_layout.addLayout(material_row)
+        self.assign_faces_button = QPushButton("Asignar a caras seleccionadas")
+        self.assign_faces_button.setObjectName("secondaryButton")
+        self.assign_faces_button.clicked.connect(self.assign_material_to_selected_faces)
+        inspector_layout.addWidget(self.assign_faces_button)
         self.transform_panel = QWidget()
         self.transform_panel.setObjectName("transformPanel")
         transform_layout = QGridLayout(self.transform_panel)
@@ -652,6 +672,7 @@ class MainWindow(QMainWindow):
         self.merge_action.setEnabled(mode == "edit" and component == "vertex" and bool(self.viewport.selected_node))
         self.boolean_action.setEnabled(mode == "object" and bool(self.viewport.selected_node))
         self._sync_mirror_controls(self.viewport.selected_node)
+        self._refresh_material_controls(self.viewport.selected_node)
         if self.viewport.insetting:
             self.edit_status.setText("INSET \u00b7 Arrastra a la derecha para ajustar \u00b7 Enter confirma \u00b7 Esc cancela")
         elif self.viewport.extruding:
@@ -758,6 +779,63 @@ class MainWindow(QMainWindow):
                 del blocker
         color = node_display_color(node) if node else (0.32, 0.35, 0.40)
         self.display_color_button.setStyleSheet(f"background-color: {QColor.fromRgbF(*color).name()}; color: #f2f3f5;")
+        self._refresh_material_controls(node)
+
+    def _refresh_material_controls(self, node=None) -> None:
+        materials = ensure_material_library(self.project.data) if self.project else []
+        current_id = node.get("material_id") if node else None
+        self.material_combo.blockSignals(True)
+        self.material_combo.clear()
+        self.material_combo.addItem("Sin material", None)
+        for material in materials:
+            self.material_combo.addItem(material.get("name", "Material"), material.get("id"))
+        self.material_combo.setCurrentIndex(max(0, self.material_combo.findData(current_id)))
+        self.material_combo.blockSignals(False)
+        self.material_combo.setEnabled(bool(node))
+        self.material_edit_button.setEnabled(bool(self.project))
+        selected_faces = (node is not None and self.viewport.mode == "edit"
+                          and self.viewport.component_mode == "face" and bool(self.viewport.selected_components))
+        self.assign_faces_button.setEnabled(selected_faces)
+
+    def _assign_node_material(self, _index: int) -> None:
+        node = self.viewport.selected_node
+        if not self.project or not node:
+            return
+        material_id = self.material_combo.currentData()
+        if node.get("material_id") == material_id:
+            return
+        if material_id is None:
+            node.pop("material_id", None)
+        else:
+            node["material_id"] = material_id
+        self.viewport.update()
+        self._mark_project_dirty()
+
+    def assign_material_to_selected_faces(self) -> None:
+        node = self.viewport.selected_node
+        if not self.project or not node or self.viewport.mode != "edit" or self.viewport.component_mode != "face":
+            return
+        geometry = ensure_editable_geometry(node.setdefault("geometry", {}))
+        face_materials = list(geometry.get("face_materials", [None] * len(geometry["faces"])))
+        material_id = self.material_combo.currentData()
+        selected = {index for index in self.viewport.selected_components if 0 <= index < len(face_materials)}
+        if not selected:
+            return
+        for index in selected:
+            face_materials[index] = material_id
+        geometry["face_materials"] = face_materials
+        self.viewport.update()
+        self._mark_project_dirty()
+
+    def open_material_editor(self) -> None:
+        if not self.project:
+            return
+        result = MaterialEditorDialog(self.project.data, self).exec()
+        self.viewport.set_material_library(self.project.data)
+        self._refresh_material_controls(self.viewport.selected_node)
+        self.viewport.update()
+        if result == QDialog.DialogCode.Accepted:
+            self._mark_project_dirty()
 
     def choose_display_color(self) -> None:
         node = self.viewport.selected_node
@@ -1092,12 +1170,14 @@ class MainWindow(QMainWindow):
 
     def show_project(self, project: Project) -> None:
         self.project = project
+        ensure_material_library(project.data)
         self.project_title.setText(project.name)
         self.project_type.setText(PROJECT_TYPES[project.kind])
         self.save_state.setText("●  Guardado")
         self.setWindowTitle(f"{project.name} — Puki3D")
         self._refresh_outliner(None)
         self.viewport.set_vehicle_system(project.data.get("vehicle_system"))
+        self.viewport.set_material_library(project.data)
         self._update_transform_fields(None)
         self._set_project_actions(True)
         self.stack.setCurrentWidget(self.workspace)

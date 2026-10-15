@@ -7,18 +7,26 @@ from math import cos, pi, radians, sin
 import numpy as np
 from copy import deepcopy
 from OpenGL.GL import (
-    GL_AMBIENT, GL_COLOR_BUFFER_BIT, GL_COLOR_MATERIAL, GL_DEPTH_BUFFER_BIT,
-    GL_DEPTH_TEST, GL_DIFFUSE, GL_LIGHT0, GL_LIGHTING,
+    GL_AMBIENT, GL_BLEND, GL_COLOR_BUFFER_BIT, GL_COLOR_MATERIAL, GL_DEPTH_BUFFER_BIT,
+    GL_DIFFUSE, GL_MODULATE, GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA, GL_SHININESS,
+    GL_SPECULAR, GL_TEXTURE_2D, GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE,
+    GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
+    GL_CLAMP_TO_EDGE, GL_LINEAR, GL_RGBA, GL_UNSIGNED_BYTE, GL_UNPACK_ALIGNMENT,
+    GL_DEPTH_TEST, GL_LIGHT0, GL_LIGHTING,
     GL_LIGHT_MODEL_AMBIENT, GL_LINES, GL_MODELVIEW, GL_NORMALIZE,
     GL_LINE_LOOP, GL_POINTS, GL_PROJECTION, GL_SMOOTH,
     GL_TRIANGLES, glBegin, glClear, glClearColor,
-    glColor3f, glColorMaterial, glDepthFunc, glDisable, glEnable, glEnd,
-    glFlush, glLightModelfv, glLightfv, glLineWidth, glLoadMatrixf,
-    glMatrixMode, glMultMatrixf, glNormal3f, glPointSize,
-    glPopMatrix, glPushMatrix, glShadeModel, glVertex3f, glViewport,
+    glBindTexture, glBlendFunc, glColor3f, glColor4f, glColorMaterial, glDepthFunc, glDepthMask,
+    glDisable, glEnable, glEnd,
+    glFlush, glGenTextures, glLightModelfv, glLightfv, glLineWidth, glLoadMatrixf, glMatrixMode,
+    glMaterialf, glMaterialfv, glMultMatrixf, glNormal3f, glPixelStorei, glPointSize,
+    glPopMatrix, glPushMatrix, glShadeModel, glTexCoord2f, glTexEnvi, glTexImage2D,
+    glTexParameteri, glVertex3f, glViewport,
     GL_FRONT_AND_BACK, GL_LEQUAL, GL_LINE, GL_FILL, GL_AMBIENT_AND_DIFFUSE,
 )
 from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QByteArray
+from PySide6.QtGui import QImage
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from .camera import (
@@ -46,6 +54,7 @@ from .scene import (
     raycast,
 )
 from .vehicle import mount_point_world_position, vehicle_preview_node_matrix
+from .materials import material_color
 
 
 def _silhouette_edge_ids(geometry: dict, eye_local: np.ndarray) -> list[int]:
@@ -78,6 +87,7 @@ def _snap_axis_amount(start: float, amount: float, targets: list[float], step: f
 
 class SceneViewport(QOpenGLWidget):
     selectionChanged = Signal(object)
+    componentSelectionChanged = Signal(object)
     transformChanged = Signal(object)
     sceneChanged = Signal()
     modeChanged = Signal(str, str)
@@ -126,6 +136,9 @@ class SceneViewport(QOpenGLWidget):
         self.show_locators = True
         self.selected_locator_id: str | None = None
         self.vehicle_preview = {"active": False, "steering": 0.0, "wheel_rotation": 0.0, "suspension": 0.0}
+        self.materials: dict[str, dict] = {}
+        self.textures: dict[str, dict] = {}
+        self._gl_textures: dict[str, tuple[int, bool]] = {}
 
     @property
     def selected_node(self) -> dict | None:
@@ -143,6 +156,11 @@ class SceneViewport(QOpenGLWidget):
         valid_ids = {point.get("id") for point in (self.vehicle_system or {}).get("mount_points", [])}
         if self.selected_locator_id not in valid_ids:
             self.selected_locator_id = None
+        self.update()
+
+    def set_material_library(self, project_data: dict) -> None:
+        self.materials = {item.get("id"): item for item in project_data.get("materials", []) if item.get("id")}
+        self.textures = {item.get("id"): item for item in project_data.get("textures", []) if item.get("id")}
         self.update()
 
     def set_vehicle_preview(self, active: bool, steering: float = 0.0,
@@ -190,6 +208,7 @@ class SceneViewport(QOpenGLWidget):
         self.selected_components.clear()
         self._hover_axis = None
         self.modeChanged.emit(self.mode, self.component_mode)
+        self.componentSelectionChanged.emit(set())
         self.update()
 
     def set_component_mode(self, mode: str) -> None:
@@ -198,6 +217,7 @@ class SceneViewport(QOpenGLWidget):
         self.component_mode = mode
         self.selected_components.clear()
         self.modeChanged.emit(self.mode, self.component_mode)
+        self.componentSelectionChanged.emit(set())
         self.update()
 
     def select_all_components(self) -> None:
@@ -897,9 +917,10 @@ class SceneViewport(QOpenGLWidget):
         glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
         glEnable(GL_NORMALIZE)
         glShadeModel(GL_SMOOTH)
-        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.28, 0.30, 0.34, 1.0])
-        glLightfv(GL_LIGHT0, GL_AMBIENT, [0.20, 0.20, 0.22, 1.0])
-        glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.82, 0.82, 0.78, 1.0])
+        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.18, 0.19, 0.22, 1.0])
+        glLightfv(GL_LIGHT0, GL_AMBIENT, [0.10, 0.10, 0.11, 1.0])
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.62, 0.64, 0.68, 1.0])
+        glLightfv(GL_LIGHT0, GL_SPECULAR, [0.32, 0.34, 0.38, 1.0])
 
     def resizeGL(self, width: int, height: int) -> None:  # noqa: N802 - Qt API
         glViewport(0, 0, max(width, 1), max(height, 1))
@@ -951,7 +972,14 @@ class SceneViewport(QOpenGLWidget):
         steering = vehicle.get("steering", {}).get("max_angle", 35.0)
         travel = vehicle.get("suspension", {}).get("travel", 0.25)
         preview = self.vehicle_preview
-        for node in self.nodes:
+        def is_transparent(node: dict) -> bool:
+            ids = [node.get("material_id")]
+            ids.extend(node.get("geometry", {}).get("face_materials", []))
+            return any(float(self.materials.get(material_id, {}).get("opacity", 1.0)) < 0.999
+                       for material_id in ids if material_id)
+
+        draw_order = sorted(self.nodes, key=is_transparent)
+        for node in draw_order:
             try:
                 geometry, _ = self._evaluated_geometry(node)
             except MeshTopologyError:
@@ -967,20 +995,108 @@ class SceneViewport(QOpenGLWidget):
                     node, preview["steering"], preview["wheel_rotation"], preview["suspension"], steering, travel
                 )
             glMultMatrixf(np.asarray(matrix.T, dtype=np.float32))
-            glColor3f(*node_display_color(node))
-            glBegin(GL_TRIANGLES)
-            for triangle in triangles:
+            face_materials = geometry.get("face_materials", [])
+            face_uvs = geometry.get("face_uvs", [])
+            for triangle_index, triangle in enumerate(triangles):
+                face_id = geometry.get("triangle_faces", [0] * len(triangles))[triangle_index]
+                material_id = face_materials[face_id] if face_id < len(face_materials) else None
+                material = self.materials.get(material_id or node.get("material_id"))
+                uv_lookup = {}
+                if face_id < len(face_uvs) and face_id < len(geometry.get("faces", [])):
+                    uv_lookup = dict(zip(geometry["faces"][face_id], face_uvs[face_id]))
+                texture_id, texture_alpha = self._apply_gl_material(material, node)
+                uv_transform = material.get("uv_transform", {}) if material else {}
                 a, b, c = (np.asarray(vertices[index], dtype=float) for index in triangle)
                 normal = np.cross(b - a, c - a)
                 length = np.linalg.norm(normal)
                 if length:
                     normal /= length
+                glBegin(GL_TRIANGLES)
                 glNormal3f(float(normal[0]), float(normal[1]), float(normal[2]))
                 for index in triangle:
                     point = vertices[index]
+                    if texture_id:
+                        uv = uv_lookup.get(index, (0.0, 0.0))
+                        u, v = self._transform_uv(uv, uv_transform)
+                        glTexCoord2f(u, v)
                     glVertex3f(float(point[0]), float(point[1]), float(point[2]))
-            glEnd()
+                glEnd()
+            glDisable(GL_TEXTURE_2D)
+            glDisable(GL_BLEND)
+            glDepthMask(True)
             glPopMatrix()
+
+    @staticmethod
+    def _transform_uv(uv, transform: dict) -> tuple[float, float]:
+        scale = transform.get("scale", [1.0, 1.0])
+        offset = transform.get("offset", [0.0, 0.0])
+        angle = radians(float(transform.get("rotation", 0.0)))
+        u, v = float(uv[0]) * float(scale[0]), float(uv[1]) * float(scale[1])
+        rotated_u = u * cos(angle) - v * sin(angle)
+        rotated_v = u * sin(angle) + v * cos(angle)
+        return rotated_u + float(offset[0]), rotated_v + float(offset[1])
+
+    def _gl_texture(self, texture_id: str | None) -> tuple[int | None, bool]:
+        if not texture_id or texture_id not in self.textures:
+            return None, False
+        if texture_id in self._gl_textures:
+            return self._gl_textures[texture_id]
+        try:
+            import base64
+
+            asset = self.textures[texture_id]
+            raw = base64.b64decode(asset.get("data_base64", ""), validate=True)
+            image = QImage.fromData(QByteArray(raw))
+            if image.isNull():
+                return None, False
+            has_alpha = image.hasAlphaChannel()
+            image = image.mirrored().convertToFormat(QImage.Format.Format_RGBA8888)
+            pixels = bytes(image.constBits())
+            texture = int(glGenTextures(1))
+            glBindTexture(GL_TEXTURE_2D, texture)
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image.width(), image.height(), 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, pixels)
+            self._gl_textures[texture_id] = (texture, has_alpha)
+            return texture, has_alpha
+        except (ValueError, KeyError, TypeError, RuntimeError):
+            return None, False
+
+    def _apply_gl_material(self, material: dict | None, node: dict) -> tuple[str | None, bool]:
+        if material:
+            rgb = material_color(material)
+            metallic = min(1.0, max(0.0, float(material.get("metallic", 0.0))))
+            roughness = min(1.0, max(0.04, float(material.get("roughness", 0.5))))
+            opacity = min(1.0, max(0.0, float(material.get("opacity", 1.0))))
+            specular = [0.04 * (1.0 - metallic) + component * metallic for component in rgb]
+            shininess = max(2.0, (1.0 - roughness) ** 2 * 128.0)
+            texture_id = material.get("texture_id")
+        else:
+            rgb = node_display_color(node)
+            opacity, texture_id, specular, shininess = 1.0, None, [0.04, 0.04, 0.04], 18.0
+        glColor4f(float(rgb[0]), float(rgb[1]), float(rgb[2]), opacity)
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [*specular, 1.0])
+        glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, shininess)
+        texture, has_alpha = self._gl_texture(texture_id)
+        if texture:
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, texture)
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+        else:
+            glDisable(GL_TEXTURE_2D)
+        transparent = opacity < 0.999 or has_alpha
+        if transparent:
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glDepthMask(False)
+        else:
+            glDisable(GL_BLEND)
+            glDepthMask(True)
+        return texture_id if texture else None, transparent
 
     def _draw_locators(self) -> None:
         if not self.show_locators or not self.vehicle_system:
@@ -1327,6 +1443,7 @@ class SceneViewport(QOpenGLWidget):
                         self.selected_components.remove(component)
                     else:
                         self.selected_components.add(component)
+                    self.componentSelectionChanged.emit(set(self.selected_components))
                     self.update()
                     event.accept()
                     return

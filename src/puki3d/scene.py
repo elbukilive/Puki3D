@@ -97,12 +97,23 @@ def _geometry(vertices: list, faces: list[list[int]]) -> dict:
         raise MeshTopologyError("Los vértices deben tener tres coordenadas finitas.")
     faces = [[int(index) for index in face] for face in faces]
     triangles = []
+    triangle_faces = []
     face_normals = []
+    face_uvs = []
     vertex_normals = np.zeros((len(vertices), 3), dtype=float)
     for face in faces:
         normal, area = _face_normal(vertices, face)
         face_normals.append(normal.tolist())
-        triangles.extend(_triangulate_face(vertices, face))
+        dominant_axis = int(np.argmax(np.abs(normal)))
+        projected = np.delete(np.asarray([vertices[index] for index in face], dtype=float), dominant_axis, axis=1)
+        bounds = np.asarray(vertices, dtype=float)
+        projected_bounds = np.delete(bounds, dominant_axis, axis=1)
+        uv_min = projected_bounds.min(axis=0)
+        uv_size = np.maximum(projected_bounds.max(axis=0) - uv_min, 1e-9)
+        face_uvs.append(((projected - uv_min) / uv_size).tolist())
+        face_triangles = _triangulate_face(vertices, face)
+        triangles.extend(face_triangles)
+        triangle_faces.extend([len(face_normals) - 1] * len(face_triangles))
         for index in face:
             vertex_normals[index] += normal * area
     for index, normal in enumerate(vertex_normals):
@@ -127,8 +138,11 @@ def _geometry(vertices: list, faces: list[list[int]]) -> dict:
         "face_edges": face_edges,
         "faces": faces,
         "triangles": triangles,
+        "triangle_faces": triangle_faces,
         "face_normals": face_normals,
         "vertex_normals": vertex_normals.tolist(),
+        "face_uvs": face_uvs,
+        "face_materials": [None] * len(faces),
     }
 
 
@@ -230,7 +244,17 @@ def ensure_editable_geometry(geometry: dict) -> dict:
     """Upgrade legacy triangle-only geometry in place without changing its shape."""
     if not geometry.get("faces"):
         geometry["faces"] = [list(triangle) for triangle in geometry.get("triangles", [])]
-    geometry.update(_geometry(geometry.get("vertices", []), geometry["faces"]))
+    old_faces = geometry["faces"]
+    old_face_uvs = geometry.get("face_uvs")
+    old_face_materials = geometry.get("face_materials")
+    rebuilt = _geometry(geometry.get("vertices", []), old_faces)
+    if old_faces == geometry.get("faces"):
+        if isinstance(old_face_uvs, list) and len(old_face_uvs) == len(old_faces):
+            if all(isinstance(uvs, list) and len(uvs) == len(face) for uvs, face in zip(old_face_uvs, old_faces)):
+                rebuilt["face_uvs"] = old_face_uvs
+        if isinstance(old_face_materials, list) and len(old_face_materials) == len(old_faces):
+            rebuilt["face_materials"] = old_face_materials
+    geometry.update(rebuilt)
     return geometry
 
 
