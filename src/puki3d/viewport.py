@@ -735,6 +735,8 @@ class SceneViewport(QOpenGLWidget):
         axis = self._axis_vector(axis_index)
         origin, direction = self._ray_for_point(point)
         pivot_world = self._drag_pivot_world
+        baseline = self._drag_geometry["vertices"]
+        matrix = node_matrix(node)
         if self.tool == "rotate":
             current = self._ray_plane_vector(point, pivot_world, axis)
             if current is None or self._drag_rotation_start is None:
@@ -756,8 +758,6 @@ class SceneViewport(QOpenGLWidget):
                 amount = _snap_axis_amount(float(np.dot(selected_world, axis)), amount, targets)
             else:
                 amount = round(amount / 0.25) * 0.25
-        baseline = self._drag_geometry["vertices"]
-        matrix = node_matrix(node)
         inverse = np.linalg.inv(matrix)
         transform = np.eye(3)
         if self.tool == "rotate":
@@ -790,6 +790,47 @@ class SceneViewport(QOpenGLWidget):
         if node is None:
             return
         self.camera.target = np.asarray(node["transform"]["position"], dtype=float).copy()
+        self.update()
+
+    def _snap_object_axis_amount(self, node: dict, axis_index: int, amount: float) -> float:
+        """Snap an object move to the world grid or a vertex on another object."""
+        start = float(node.get("transform", {}).get("position", [0.0, 0.0, 0.0])[axis_index])
+        targets = []
+        for other in self.nodes:
+            if other.get("id") == node.get("id"):
+                continue
+            vertices = other.get("geometry", {}).get("vertices", [])
+            if not vertices:
+                continue
+            matrix = node_matrix(other)
+            for vertex in vertices:
+                world = matrix @ np.append(np.asarray(vertex, dtype=float), 1.0)
+                targets.append(float(world[axis_index]))
+        return _snap_axis_amount(start, amount, targets)
+
+    def set_camera_view(self, view: str) -> None:
+        presets = {
+            "three_quarter": (-48.0, 28.0),
+            "front": (0.0, 0.0),
+            "side": (90.0, 0.0),
+            "top": (-48.0, 84.0),
+        }
+        if view not in presets:
+            return
+        points = []
+        for node in self.nodes:
+            vertices = node.get("geometry", {}).get("vertices", [])
+            if not vertices:
+                continue
+            matrix = node_matrix(node)
+            points.extend((matrix @ np.append(np.asarray(vertex, dtype=float), 1.0))[:3] for vertex in vertices)
+        if points:
+            bounds = np.asarray(points, dtype=float)
+            self.camera.target = (bounds.min(axis=0) + bounds.max(axis=0)) * 0.5
+            radius = float(np.max(np.linalg.norm(bounds - self.camera.target, axis=1)))
+            self.camera.distance = max(2.0, radius / max(sin(self.camera.field_of_view / 2), 1e-6) * 1.2)
+        self.camera.azimuth = radians(presets[view][0])
+        self.camera.elevation = radians(presets[view][1])
         self.update()
 
     def initializeGL(self) -> None:  # noqa: N802 - Qt API
@@ -1256,6 +1297,8 @@ class SceneViewport(QOpenGLWidget):
                 else:
                     amount = 0.0
                 if self.tool == "move":
+                    if self.snapping:
+                        amount = self._snap_object_axis_amount(node, axis_index, amount)
                     position = np.asarray(transform["position"], dtype=float)
                     position[axis_index] += amount
                     node["transform"]["position"] = position.tolist()

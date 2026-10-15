@@ -5,6 +5,7 @@ import copy
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -58,6 +59,7 @@ class WorkspaceSyncTests(unittest.TestCase):
         grouped_tools = {button.text() for button in self.window.findChildren(QToolButton)}
         self.assertIn("Modelado", grouped_tools)
         self.assertIn("Topología", grouped_tools)
+        self.assertIn("Vista", grouped_tools)
 
         self.window.add_primitive("cube")
         viewport = self.window.viewport
@@ -78,6 +80,69 @@ class WorkspaceSyncTests(unittest.TestCase):
     def test_axis_snapping_targets_grid_and_nearby_vertices(self) -> None:
         self.assertAlmostEqual(_snap_axis_amount(0.12, 0.18, []), 0.13)
         self.assertAlmostEqual(_snap_axis_amount(0.12, 0.22, [0.34]), 0.22)
+
+    def test_object_snapping_targets_grid_and_vertices_from_other_objects(self) -> None:
+        self.window.add_primitive("cube")
+        first = self.window.viewport.selected_node
+        self.window.add_primitive("cube")
+        second = self.window.viewport.selected_node
+        second["transform"]["position"][0] = 1.1
+        self.window.viewport.snapping = True
+
+        self.assertAlmostEqual(self.window.viewport._snap_object_axis_amount(first, 0, 0.62), 0.6)
+
+    def test_new_primitives_and_duplicates_keep_a_predictable_alignment(self) -> None:
+        self.window.add_primitive("cube")
+        first = self.window.viewport.selected_node
+        first["transform"]["position"] = [2.0, -0.5, 1.25]
+
+        self.window.add_primitive("cube")
+        second = self.window.viewport.selected_node
+        self.assertEqual(second["transform"]["position"], [2.0, -0.5, 1.25])
+
+        self.window.duplicate_selected()
+        duplicate = self.window.viewport.selected_node
+        self.assertEqual(duplicate["transform"], second["transform"])
+        self.assertEqual(duplicate["geometry"], second["geometry"])
+        self.assertIsNot(duplicate["geometry"], second["geometry"])
+
+    def test_selected_object_can_be_renamed_for_outliner_organization(self) -> None:
+        self.window.add_primitive("cube")
+        node = self.window.viewport.selected_node
+        with patch("puki3d.ui.QInputDialog.getText", return_value=("Body · Chasis", True)):
+            self.window.rename_selected_object()
+
+        self.assertEqual(node["name"], "Body · Chasis")
+        self.assertIn("Body · Chasis", self.window.outliner.currentItem().text())
+        self.assertEqual(self.window.object_hint.text(), "Body · Chasis")
+
+    def test_object_snap_move_and_camera_views_are_available(self) -> None:
+        self.window.add_primitive("cube")
+        viewport = self.window.viewport
+        node = viewport.selected_node
+        viewport.set_mode("edit")
+        viewport.set_component_mode("vertex")
+        viewport.selected_components = {4}
+        viewport.set_tool("move")
+        viewport.snapping = True
+        before = copy.deepcopy(node["geometry"])
+        viewport._drag_geometry_before = before
+        viewport._drag_geometry = copy.deepcopy(before)
+        viewport._drag_pivot_world = viewport._component_pivot(node)
+        viewport._drag_axis = 0
+        viewport._drag_axis_start = None
+        viewport._drag_start = QPoint(100, 100)
+
+        viewport._apply_component_transform(QPoint(200, 100))
+        self.assertAlmostEqual(node["geometry"]["vertices"][4][0], 0.5)
+        viewport._record_geometry_change(before)
+        viewport.undo_edit()
+        self.assertEqual(node["geometry"], before)
+
+        viewport.set_camera_view("side")
+        self.assertAlmostEqual(viewport.camera.azimuth, np.radians(90.0))
+        viewport.set_camera_view("three_quarter")
+        self.assertAlmostEqual(viewport.camera.azimuth, np.radians(-48.0))
 
     def test_topology_diagnostics_refresh_after_geometry_changes_and_undo(self) -> None:
         self.window.add_primitive("cube")

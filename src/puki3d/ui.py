@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -432,6 +433,16 @@ class MainWindow(QMainWindow):
             self.mirror_axis_actions[axis_index] = action
         mirror_button.setMenu(mirror_menu)
         canvas_toolbar.addWidget(mirror_button)
+        view_button = QToolButton()
+        view_button.setText("Vista")
+        view_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        view_menu = QMenu(view_button)
+        for label, view in (("Tres cuartos", "three_quarter"), ("Frente", "front"), ("Lateral", "side"), ("Superior", "top")):
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked=False, current=view: self.viewport.set_camera_view(current))
+            view_menu.addAction(action)
+        view_button.setMenu(view_menu)
+        canvas_toolbar.addWidget(view_button)
         canvas_toolbar.addStretch()
         view_mode = QLabel("Perspectiva  ·  3D")
         view_mode.setObjectName("muted")
@@ -480,6 +491,7 @@ class MainWindow(QMainWindow):
         self.outliner = QListWidget()
         self.outliner.setObjectName("outliner")
         self.outliner.currentRowChanged.connect(self._on_outliner_selection)
+        self.outliner.itemDoubleClicked.connect(lambda _item: self.rename_selected_object())
         inspector_layout.addWidget(self.outliner, 2)
         object_actions = QHBoxLayout()
         object_actions.setContentsMargins(10, 8, 10, 8)
@@ -493,8 +505,14 @@ class MainWindow(QMainWindow):
         self._add_primitive_actions(object_menu)
         add_object.setMenu(object_menu)
         object_actions.addWidget(add_object)
+        rename_object_button = QPushButton("✎")
+        rename_object_button.setToolTip("Renombrar objeto")
+        rename_object_button.setAccessibleName("Renombrar objeto")
+        rename_object_button.setObjectName("secondaryButton")
+        rename_object_button.clicked.connect(self.rename_selected_object)
+        object_actions.addWidget(rename_object_button)
         duplicate_button = QPushButton("⧉")
-        duplicate_button.setToolTip("Duplicar objeto (Ctrl+D)")
+        duplicate_button.setToolTip("Duplicar objeto en la misma posición (Ctrl+D)")
         duplicate_button.setObjectName("secondaryButton")
         duplicate_button.clicked.connect(self.duplicate_selected)
         object_actions.addWidget(duplicate_button)
@@ -566,6 +584,8 @@ class MainWindow(QMainWindow):
         duplicate_shortcut = QShortcut("Ctrl+D", self.viewport)
         duplicate_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         duplicate_shortcut.activated.connect(self.duplicate_selected)
+        rename_shortcut = QShortcut("F2", self)
+        rename_shortcut.activated.connect(self.rename_selected_object)
         undo_shortcut = QShortcut("Ctrl+Z", self.viewport)
         undo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         undo_shortcut.activated.connect(self.viewport.undo_edit)
@@ -718,8 +738,9 @@ class MainWindow(QMainWindow):
         nodes = self._active_scene_nodes()
         ordinal = sum(node.get("primitive") == primitive for node in nodes) + 1
         node = create_node(primitive, ordinal)
-        if nodes:
-            node["transform"]["position"][0] = len(nodes) * 0.7
+        selected = self.viewport.selected_node
+        if selected:
+            node["transform"]["position"] = list(selected.get("transform", {}).get("position", [0.0, 0.0, 0.0]))
         nodes.append(node)
         self._refresh_outliner(node["id"])
         self._mark_project_dirty()
@@ -733,10 +754,29 @@ class MainWindow(QMainWindow):
         duplicate = copy.deepcopy(selected)
         duplicate["id"] = str(uuid4())
         duplicate["name"] = f"{selected.get('name', 'Objeto')} copia"
-        duplicate["transform"]["position"][0] += 0.75
         nodes = self._active_scene_nodes()
         nodes.append(duplicate)
         self._refresh_outliner(duplicate["id"])
+        self._mark_project_dirty()
+
+    def rename_selected_object(self) -> None:
+        selected = self.viewport.selected_node
+        if not self.project or not selected:
+            return
+        name, accepted = QInputDialog.getText(
+            self,
+            "Renombrar objeto",
+            "Nombre",
+            text=selected.get("name", "Objeto"),
+        )
+        if not accepted:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.information(self, "Nombre no válido", "Escribe un nombre para el objeto.")
+            return
+        selected["name"] = name
+        self._refresh_outliner(selected["id"])
         self._mark_project_dirty()
 
     def delete_selected(self) -> None:
