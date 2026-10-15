@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import copy
 
 import numpy as np
 
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
 from .project import PROJECT_EXTENSION, PROJECT_TYPES, Project, ProjectError
 from .scene import MeshTopologyError, PRIMITIVES, create_node, ensure_editable_geometry, node_matrix, node_display_color
 from .viewport import SceneViewport
+from .vehicle_ui import VehicleSystemDialog
 
 
 BACKGROUND = "#101114"
@@ -133,6 +135,11 @@ class MainWindow(QMainWindow):
         self.rename_action = QAction("Renombrar…", self)
         self.rename_action.triggered.connect(self.rename_project)
         project_menu.addAction(self.rename_action)
+        vehicle_action = QAction("Sistema de vehículo…", self)
+        vehicle_action.triggered.connect(self.open_vehicle_system)
+        project_menu.addSeparator()
+        project_menu.addAction(vehicle_action)
+        self.vehicle_action = vehicle_action
         project_menu.addSeparator()
         close_action = QAction("Cerrar proyecto", self)
         close_action.setShortcut("Ctrl+W")
@@ -1095,6 +1102,29 @@ class MainWindow(QMainWindow):
             return
         self.save_state.setText("●  Guardado")
         self._remember_project(self.project)
+
+    def open_vehicle_system(self) -> None:
+        if not self.project:
+            return
+        nodes = self._active_scene_nodes()
+        selected_id = self.viewport.selected_id
+        dialog = VehicleSystemDialog(self.project.data, nodes, selected_id, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.project.data["vehicle_system"] = copy.deepcopy(dialog.project_data["vehicle_system"])
+        self.project.data["project"]["type"] = "vehicle"
+        edited_nodes = {node.get("id"): node for node in dialog.nodes}
+        for node in nodes:
+            edited = edited_nodes.get(node.get("id"))
+            if edited:
+                node["vehicle"] = copy.deepcopy(edited.get("vehicle", {}))
+                if edited.get("transform", {}).get("position") != node.get("transform", {}).get("position"):
+                    node.setdefault("transform", {})["position"] = list(edited["transform"]["position"])
+        if self.viewport.selected_node:
+            self._update_transform_fields(self.viewport.selected_node)
+        self.viewport.update()
+        self.project_type.setText(PROJECT_TYPES[self.project.kind])
+        self._mark_project_dirty()
 
     def rename_project(self) -> None:
         if not self.project:
