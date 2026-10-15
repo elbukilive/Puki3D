@@ -77,6 +77,38 @@ class ATSConfigTests(unittest.TestCase):
         self.assertIn("materials", codes)
         self.assertIn("verification", codes)
 
+    def test_validator_separates_fix_now_build_resources_and_game_verification(self):
+        data, nodes = vehicle_fixture()
+        ensure_ats_config(data, nodes)
+        messages = ats_diagnostics(data, nodes)
+        by_code = {item["code"]: item for item in messages}
+        self.assertEqual(by_code["engine_volume"]["phase"], "config")
+        self.assertEqual(by_code["fallbacks"]["phase"], "build")
+        self.assertEqual(by_code["fallbacks"]["level"], "info")
+        self.assertEqual(by_code["model_geometry"]["phase"], "build")
+        self.assertEqual(by_code["locator_export"]["phase"], "build")
+        self.assertEqual(by_code["manifest"]["phase"], "build")
+        self.assertEqual(by_code["verification"]["phase"], "game")
+        self.assertEqual(data["ats_config"]["status"], "prepared_unverified")
+
+    def test_missing_light_mount_points_are_fixable_before_build(self):
+        data, nodes = vehicle_fixture()
+        ensure_ats_config(data, nodes)
+        data["vehicle_system"]["mount_points"] = []
+        by_code = {item["code"]: item for item in ats_diagnostics(data, nodes)}
+        self.assertEqual(by_code["light_locators"]["phase"], "config")
+        self.assertEqual(by_code["light_locators"]["level"], "error")
+        self.assertEqual(by_code["locator_export"]["phase"], "build")
+
+    def test_dialog_flags_nonempty_malformed_torque_curve_as_configuration_error(self):
+        data, nodes = vehicle_fixture()
+        dialog = ATSConfigDialog(data, nodes)
+        dialog.torque_curve.setText("not-a-curve")
+        items = [dialog.diagnostics["config"].item(i).text()
+                 for i in range(dialog.diagnostics["config"].count())]
+        self.assertTrue(any("torque_curve" in item or "Formato invalido" in item for item in items))
+        self.assertNotIn("_curve_text_invalid", data.get("ats_config", {}).get("engine", {}))
+
     def test_validator_accepts_well_formed_preparation_but_never_marks_it_game_verified(self):
         data, nodes = vehicle_fixture()
         cfg = complete_draft(data, nodes)

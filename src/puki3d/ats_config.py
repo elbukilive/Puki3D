@@ -7,7 +7,7 @@ import re
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QHBoxLayout,
+    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QGroupBox,
     QLabel, QLineEdit, QListWidget, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -90,6 +90,14 @@ def _message(level: str, code: str, message: str) -> dict[str, str]:
     return {"level": level, "code": code, "message": message}
 
 
+_BUILD_CODES = {
+    "fallbacks", "fallbacks_unresolved", "head_light", "camera_interior_camera",
+    "collision", "collision_path", "sound_exterior",
+    "sound_interior", "materials", "dlc_unverified", "external_references",
+    "locator_export", "model_geometry", "manifest",
+}
+
+
 def ats_diagnostics(project_data: dict, nodes: list[dict], installed_dlcs: set[str] | None = None) -> list[dict[str, str]]:
     """Report actual SCS truck-data requirements and mark unverified Puki3D data."""
     config = project_data.get("ats_config", {})
@@ -150,6 +158,8 @@ def ats_diagnostics(project_data: dict, nodes: list[dict], installed_dlcs: set[s
     if engine.get("type") == "electric" and float(engine.get("power_kw", 0) or 0) <= 0 and not engine.get("torque_curve"):
         messages.append(_message("error", "electric_power", "El motor eléctrico necesita power positivo o torque_curve."))
     curve = engine.get("torque_curve", [])
+    if engine.get("_curve_text_invalid", False):
+        messages.append(_message("error", "torque_curve_format", "Formato invalido: usa pares rpm:factor separados por coma."))
     if curve:
         if len(curve) < 2 or any(float(rpm) <= 0 or not 0 <= float(factor) <= 1 for rpm, factor in curve):
             messages.append(_message("error", "torque_curve", "Puntos (rpm, factor) requieren rpm > 0 y factor entre 0 y 1."))
@@ -181,7 +191,7 @@ def ats_diagnostics(project_data: dict, nodes: list[dict], installed_dlcs: set[s
     fallbacks = config.get("fallbacks", {})
     missing_fallbacks = [name for name in ATS_REQUIRED_FALLBACKS if not str(fallbacks.get(name, "")).strip()]
     if missing_fallbacks:
-        messages.append(_message("error", "fallbacks", "Faltan definiciones fallback obligatorias de truck_data: " + ", ".join(missing_fallbacks) + "."))
+        messages.append(_message("info", "fallbacks", "Generar durante BUILD las 15 reglas fallback obligatorias de truck_data y las unidades accessory .sii asociadas."))
     else:
         messages.append(_message("warning", "fallbacks_unresolved", "Las rutas fallback están declaradas, pero sus archivos .sii todavía no existen en un paquete y no se pueden resolver."))
     invalid_fallbacks = [name for name in ATS_REQUIRED_FALLBACKS if fallbacks.get(name)
@@ -190,25 +200,29 @@ def ats_diagnostics(project_data: dict, nodes: list[dict], installed_dlcs: set[s
     if invalid_fallbacks:
         messages.append(_message("error", "fallback_format", "Fallback debe usar tipo|ruta relativa .sii, sin '..' ni barras Windows: " + ", ".join(invalid_fallbacks) + "."))
     if not str(lights.get("headlight_unit", "")).strip():
-        messages.append(_message("error", "head_light", "Falta enlazar la unidad de faros seleccionada para el camión."))
+        messages.append(_message("info", "head_light", "BUILD: generar accessory_head_light .sii y enlazar los locators de las luces."))
     for field, label in CAMERA_FIELDS:
         if not str(cameras.get(field, "")).strip():
-            messages.append(_message("warning", f"camera_{field}", f"Falta la referencia opcional de {label} en truck_data."))
+            if field == "interior_camera":
+                messages.append(_message("info", f"camera_{field}", f"BUILD: crear una unidad SCS para {label.lower()} y enlazarla desde truck_data."))
+            else:
+                messages.append(_message("warning", f"camera_{field}", f"Falta la referencia opcional de {label} en truck_data."))
     light_mounts = [point for point in system.get("mount_points", []) if point.get("type") == "Light"] if system else []
     if not light_mounts:
-        messages.append(_message("warning", "light_locators", "No hay mount points de luces en VEHICLE SYSTEM; la ubicación de faros no está preparada."))
+        messages.append(_message("error", "light_locators", "Añade ahora mount points de tipo Light y vincula cada locator a su componente de luz."))
+    messages.append(_message("info", "locator_export", "BUILD: convertir los mount points configurados en nodos locator del modelo SCS."))
     if not any(node.get("vehicle", {}).get("role") == "collision_helper" for node in nodes):
-        messages.append(_message("warning", "collision", "No hay geometría auxiliar de colisión; faltan descriptores PMC/colisión convexa del juego."))
+        messages.append(_message("info", "collision", "BUILD: generar geometria PIC y convertir colision a PMC."))
     if not str(chassis.get("collision_path", "")).strip():
-        messages.append(_message("warning", "collision_path", "Falta ruta collision (.pmc); todavía no hay geometría de colisión ATS."))
+        messages.append(_message("info", "collision_path", "BUILD: registrar la ruta del PMC generado dentro del paquete."))
     elif ".." in str(chassis["collision_path"]) or "\\" in str(chassis["collision_path"]):
         messages.append(_message("error", "collision_path_format", "La ruta collision debe usar '/', sin '..' ni separadores Windows."))
     sounds = config.get("sounds", {})
     for key, label in (("exterior", "exterior"), ("interior", "interior")):
         if not str(sounds.get(key, "")).strip():
-            messages.append(_message("error", f"sound_{key}", f"Falta el accesorio de sonido {label}; ATS requiere unidades exterior e interior."))
+            messages.append(_message("info", f"sound_{key}", f"Generar durante BUILD el accesorio y los recursos de sonido {label} (unidad .sii y audio)."))
     if project_data.get("materials"):
-        messages.append(_message("warning", "materials", "Los materiales PBR de Puki3D aún no declaran shaders SCS; compatibilidad de materiales no verificada."))
+        messages.append(_message("info", "materials", "BUILD: convertir materiales a MAT/TOBJ/DDS con shaders SCS; sin validar en juego."))
     dlcs = config.get("dlc_dependencies", [])
     if any(not _DEPENDENCY_ID.fullmatch(str(item)) for item in dlcs):
         messages.append(_message("error", "dlc_dependency_format", "Las dependencias DLC deben ser identificadores internos sin rutas ni espacios."))
@@ -217,14 +231,20 @@ def ats_diagnostics(project_data: dict, nodes: list[dict], installed_dlcs: set[s
         if missing:
             messages.append(_message("warning", "dlc_unresolved", "DLC no detectados en esta instalación: " + ", ".join(missing) + "."))
     if dlcs:
-        messages.append(_message("warning", "dlc_unverified", "Las DLC declaradas aún no se han resuelto contra un paquete de mod."))
+        messages.append(_message("info", "dlc_unverified", "Las DLC declaradas aún no se han resuelto contra un paquete de mod."))
     if config.get("external_references"):
-        messages.append(_message("warning", "external_references", "Las referencias externas no pueden resolverse hasta preparar el paquete de mod."))
+        messages.append(_message("info", "external_references", "Las referencias externas no pueden resolverse hasta preparar el paquete de mod."))
     invalid_references = [item for item in config.get("external_references", [])
                           if "\\" in str(item) or ".." in str(item) or not str(item).startswith("/")]
     if invalid_references:
         messages.append(_message("error", "external_reference_format", "Las rutas SCS deben empezar con '/' y usar separadores '/', sin '..'."))
-    messages.append(_message("info", "verification", "Preparación ATS en Puki3D solamente. No se han generado unidades SII/PIX ni probado el vehículo en el juego."))
+    messages.append(_message("info", "model_geometry", "BUILD: crear PIM/PIT y convertir a PMD/PMG; convertir materiales a MAT/TOBJ/DDS con shaders SCS."))
+    messages.append(_message("info", "manifest", "BUILD: crear unidades SII y estructura /def/vehicle/truck/<brand.model>/ junto con manifest.sii."))
+    messages.append(_message("info", "verification", "Verificar en ATS: conversion, montaje del paquete, carga de definiciones, compra/seleccion y funcionamiento. Compatibilidad aun no comprobada."))
+    for item in messages:
+        item["phase"] = "build" if item["code"] in _BUILD_CODES else ("game" if item["code"] == "verification" else "config")
+        if item["phase"] == "build" and item["level"] == "error":
+            item["level"] = "info"
     return messages
 
 
@@ -281,12 +301,13 @@ class ATSConfigDialog(QDialog):
         self.suspension_types = QLineEdit(", ".join(ch.get("suspension_types", [])))
         chassis_form.addRow("axle_suspension_type (por eje)", self.suspension_types)
         self.collision_path = QLineEdit(ch.get("collision_path", ""))
-        self.collision_path.setPlaceholderText("/vehicle/truck/puki.pickup/chassis/chassis.pmc")
+        self.collision_path.setPlaceholderText("Se completa en BUILD al generar el PMC")
         chassis_form.addRow("collision (.pmc)", self.collision_path)
         self.travel = QLineEdit(", ".join(str(v) for v in ch.get("residual_travel_m", [])))
         chassis_form.addRow("residual_travel (m por eje)", self.travel)
         self.weights = QLineEdit(", ".join(str(v) for v in ch.get("kerb_weight_kg", [])))
         chassis_form.addRow("kerb_weight (kg por eje)", self.weights)
+        chassis_form.addRow(QLabel("Peso de prueba: estimaci\u00f3n de prototipo; sustituir por dato del veh\u00edculo cuando exista."))
         chassis_form.addRow(QLabel("Ruedas y orientación se leen de VEHICLE SYSTEM; el rol motriz se agrupa por eje."))
         tabs.addTab(chassis_tab, "Chasis y ruedas")
 
@@ -311,6 +332,7 @@ class ATSConfigDialog(QDialog):
         self.torque_curve = QLineEdit(", ".join(f"{rpm}:{factor}" for rpm, factor in self.config["engine"].get("torque_curve", [])))
         self.torque_curve.setPlaceholderText("Opcional: 300:0, 440:0.5, 1000:1 (rpm:factor)")
         engine_form.addRow("torque_curve", self.torque_curve)
+        engine_form.addRow(QLabel("Motor de prueba: valores estimados para validar campos; no son especificaciones de un veh\u00edculo real."))
         engine_form.addRow(QLabel("Los valores describen accessory_engine_data; el par requiere curva torque_curve antes de una simulación final."))
         tabs.addTab(engine_tab, "Motor")
 
@@ -363,7 +385,14 @@ class ATSConfigDialog(QDialog):
         tabs.addTab(fallback_tab, "Truck fallbacks")
 
         diagnostic_tab = QWidget(); diagnostic_layout = QVBoxLayout(diagnostic_tab)
-        self.diagnostics = QListWidget(); diagnostic_layout.addWidget(self.diagnostics)
+        self.diagnostics: dict[str, QListWidget] = {}
+        for key, title in (("config", "Corregir ahora - configuracion"),
+                           ("build", "Pendiente de BUILD - generar recursos"),
+                           ("game", "Verificar en ATS - compatibilidad no comprobada")):
+            group = QGroupBox(title); group_layout = QVBoxLayout(group)
+            listing = QListWidget(); listing.setMinimumHeight(90); group_layout.addWidget(listing)
+            diagnostic_layout.addWidget(group, 1)
+            self.diagnostics[key] = listing
         self.diagnostic_summary = QLabel(); diagnostic_layout.addWidget(self.diagnostic_summary)
         tabs.addTab(diagnostic_tab, "Validador ATS")
 
@@ -438,6 +467,8 @@ class ATSConfigDialog(QDialog):
                                 "kerb_weight_kg": self._csv_numbers(self.weights.text())})
         cfg["engine"].update({"type": self.engine_type.currentData(), **{key: field.value() for key, field in self.engine_fields.items()},
                                "torque_curve": self._parse_torque_curve(self.torque_curve.text())})
+        if self.torque_curve.text().strip() and not cfg["engine"]["torque_curve"]:
+            cfg["engine"]["_curve_text_invalid"] = True
         cfg["transmission"].update({"ratios_forward": self._csv_numbers(self.forward_ratios.text()),
                                      "ratios_reverse": self._csv_numbers(self.reverse_ratios.text()),
                                      "differential_ratio": self.diff_ratio.value(), "shift_time": self.shift_time.value()})
@@ -448,13 +479,13 @@ class ATSConfigDialog(QDialog):
         cfg["external_references"] = self._csv_text(self.external_refs.text())
         cfg["fallbacks"] = {key: field.text().strip() for key, field in self.fallback_fields.items()}
         messages = ats_diagnostics(draft, self.nodes)
-        self.diagnostics.clear()
+        for listing in self.diagnostics.values(): listing.clear()
         for issue in messages:
-            prefix = {"error": "ERROR", "warning": "AVISO", "info": "PREPARADO"}[issue["level"]]
-            self.diagnostics.addItem(f"{prefix} · {issue['message']}")
-        errors = sum(issue["level"] == "error" for issue in messages)
-        warnings = sum(issue["level"] == "warning" for issue in messages)
-        self.diagnostic_summary.setText(f"{errors} errores · {warnings} avisos · compatibilidad con ATS sin verificar")
+            prefix = {"error": "ERROR", "warning": "AVISO", "info": "PENDIENTE"}[issue["level"]]
+            self.diagnostics[issue["phase"]].addItem(f"{prefix} - {issue['message']}")
+        errors = sum(issue["phase"] == "config" and issue["level"] == "error" for issue in messages)
+        build = sum(issue["phase"] == "build" for issue in messages)
+        self.diagnostic_summary.setText(f"{errors} errores de configuraci\u00f3n - {build} recursos/referencias para BUILD - ATS sin verificar")
 
     def _commit(self) -> None:
         cfg = self.config
