@@ -54,7 +54,7 @@ from .scene import (
     raycast,
 )
 from .vehicle import mount_point_world_position, vehicle_preview_node_matrix
-from .materials import material_color
+from .materials import material_color, texture_has_alpha
 
 
 def _silhouette_edge_ids(geometry: dict, eye_local: np.ndarray) -> list[int]:
@@ -218,6 +218,12 @@ class SceneViewport(QOpenGLWidget):
         self.selected_components.clear()
         self.modeChanged.emit(self.mode, self.component_mode)
         self.componentSelectionChanged.emit(set())
+        self.update()
+
+    def set_component_selection(self, component_ids: set[int]) -> None:
+        """Synchronize a component selection made in a linked editor."""
+        self.selected_components = {int(index) for index in component_ids if int(index) >= 0}
+        self.componentSelectionChanged.emit(set(self.selected_components))
         self.update()
 
     def select_all_components(self) -> None:
@@ -975,8 +981,16 @@ class SceneViewport(QOpenGLWidget):
         def is_transparent(node: dict) -> bool:
             ids = [node.get("material_id")]
             ids.extend(node.get("geometry", {}).get("face_materials", []))
-            return any(float(self.materials.get(material_id, {}).get("opacity", 1.0)) < 0.999
-                       for material_id in ids if material_id)
+            for material_id in ids:
+                material = self.materials.get(material_id)
+                if not material:
+                    continue
+                if float(material.get("opacity", 1.0)) < 0.999:
+                    return True
+                texture = self.textures.get(material.get("texture_id"))
+                if texture_has_alpha(texture):
+                    return True
+            return False
 
         draw_order = sorted(self.nodes, key=is_transparent)
         for node in draw_order:

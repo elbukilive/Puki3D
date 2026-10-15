@@ -42,6 +42,7 @@ from .viewport import SceneViewport
 from .vehicle_ui import VehicleSystemDialog
 from .vehicle_preview import VehiclePreviewDialog
 from .materials import MaterialEditorDialog, ensure_material_library
+from .uv_editor import UVEditorDialog
 
 
 BACKGROUND = "#101114"
@@ -107,6 +108,7 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
         self.setMinimumSize(1050, 680)
         self.project: Project | None = None
+        self.uv_dialog: UVEditorDialog | None = None
         self.settings = QApplication.instance().organizationName()
         self._setup_menu()
         self.stack = QStackedWidget()
@@ -474,7 +476,7 @@ class MainWindow(QMainWindow):
         canvas_layout.addLayout(canvas_toolbar)
         self.viewport = SceneViewport()
         self.viewport.selectionChanged.connect(self._on_viewport_selection)
-        self.viewport.componentSelectionChanged.connect(lambda _selected: self._refresh_material_controls(self.viewport.selected_node))
+        self.viewport.componentSelectionChanged.connect(self._on_component_selection)
         self.viewport.transformChanged.connect(self._on_viewport_transform)
         self.viewport.sceneChanged.connect(self._mark_project_dirty)
         self.viewport.modeChanged.connect(self._on_viewport_mode_changed)
@@ -583,6 +585,11 @@ class MainWindow(QMainWindow):
         self.assign_faces_button.setObjectName("secondaryButton")
         self.assign_faces_button.clicked.connect(self.assign_material_to_selected_faces)
         inspector_layout.addWidget(self.assign_faces_button)
+        self.uv_editor_button = QPushButton("Editor UV")
+        self.uv_editor_button.setObjectName("secondaryButton")
+        self.uv_editor_button.setToolTip("Abrir el mapeado UV del objeto seleccionado")
+        self.uv_editor_button.clicked.connect(self.open_uv_editor)
+        inspector_layout.addWidget(self.uv_editor_button)
         self.transform_panel = QWidget()
         self.transform_panel.setObjectName("transformPanel")
         transform_layout = QGridLayout(self.transform_panel)
@@ -673,6 +680,7 @@ class MainWindow(QMainWindow):
         self.boolean_action.setEnabled(mode == "object" and bool(self.viewport.selected_node))
         self._sync_mirror_controls(self.viewport.selected_node)
         self._refresh_material_controls(self.viewport.selected_node)
+        self.uv_editor_button.setEnabled(mode == "edit" and bool(self.viewport.selected_node))
         if self.viewport.insetting:
             self.edit_status.setText("INSET \u00b7 Arrastra a la derecha para ajustar \u00b7 Enter confirma \u00b7 Esc cancela")
         elif self.viewport.extruding:
@@ -762,7 +770,39 @@ class MainWindow(QMainWindow):
         self.outliner.setCurrentRow(row)
         self.outliner.blockSignals(False)
         self._update_transform_fields(node)
+        if self.uv_dialog is not None:
+            self.uv_dialog.set_node(node, self.viewport.selected_components)
         self._on_viewport_mode_changed(self.viewport.mode, self.viewport.component_mode)
+
+    def _on_component_selection(self, selected) -> None:
+        self._refresh_material_controls(self.viewport.selected_node)
+        if self.uv_dialog is not None:
+            self.uv_dialog.set_selected_faces(selected)
+
+    def open_uv_editor(self) -> None:
+        node = self.viewport.selected_node
+        if not self.project or not node:
+            return
+        if self.viewport.mode != "edit":
+            self.viewport.set_mode("edit")
+        if self.viewport.component_mode != "face":
+            self.viewport.set_component_mode("face")
+        if self.uv_dialog is None:
+            self.uv_dialog = UVEditorDialog(self.project.data, node, self)
+            self.uv_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            self.uv_dialog.faceSelectionChanged.connect(self.viewport.set_component_selection)
+            self.uv_dialog.uvChanged.connect(self._on_uv_geometry_changed)
+            self.uv_dialog.destroyed.connect(lambda _obj=None: setattr(self, "uv_dialog", None))
+        else:
+            self.uv_dialog.project_data = self.project.data
+            self.uv_dialog.set_node(node, self.viewport.selected_components)
+        self.uv_dialog.show()
+        self.uv_dialog.raise_()
+        self.uv_dialog.activateWindow()
+
+    def _on_uv_geometry_changed(self) -> None:
+        self.viewport.update()
+        self._mark_project_dirty()
 
     def _on_viewport_transform(self, node) -> None:
         self._update_transform_fields(node)
@@ -809,6 +849,8 @@ class MainWindow(QMainWindow):
         else:
             node["material_id"] = material_id
         self.viewport.update()
+        if self.uv_dialog is not None:
+            self.uv_dialog._refresh_texture()
         self._mark_project_dirty()
 
     def assign_material_to_selected_faces(self) -> None:
@@ -825,6 +867,8 @@ class MainWindow(QMainWindow):
             face_materials[index] = material_id
         geometry["face_materials"] = face_materials
         self.viewport.update()
+        if self.uv_dialog is not None:
+            self.uv_dialog._refresh_texture()
         self._mark_project_dirty()
 
     def open_material_editor(self) -> None:

@@ -104,13 +104,7 @@ def _geometry(vertices: list, faces: list[list[int]]) -> dict:
     for face in faces:
         normal, area = _face_normal(vertices, face)
         face_normals.append(normal.tolist())
-        dominant_axis = int(np.argmax(np.abs(normal)))
-        projected = np.delete(np.asarray([vertices[index] for index in face], dtype=float), dominant_axis, axis=1)
-        bounds = np.asarray(vertices, dtype=float)
-        projected_bounds = np.delete(bounds, dominant_axis, axis=1)
-        uv_min = projected_bounds.min(axis=0)
-        uv_size = np.maximum(projected_bounds.max(axis=0) - uv_min, 1e-9)
-        face_uvs.append(((projected - uv_min) / uv_size).tolist())
+        face_uvs.append([])
         face_triangles = _triangulate_face(vertices, face)
         triangles.extend(face_triangles)
         triangle_faces.extend([len(face_normals) - 1] * len(face_triangles))
@@ -131,7 +125,7 @@ def _geometry(vertices: list, faces: list[list[int]]) -> dict:
             face_edge_ids.append(edge_id)
             edge_faces[edge_id].append(face_id)
         face_edges.append(face_edge_ids)
-    return {
+    geometry = {
         "vertices": vertices,
         "edges": [list(edge) for edge in edges],
         "edge_faces": edge_faces,
@@ -144,6 +138,105 @@ def _geometry(vertices: list, faces: list[list[int]]) -> dict:
         "face_uvs": face_uvs,
         "face_materials": [None] * len(faces),
     }
+    packed_uvs = _packed_face_uvs(vertices, faces, face_normals)
+    geometry["face_uvs"] = [packed_uvs[face_id] for face_id in range(len(faces))]
+    return geometry
+
+
+def _project_face(vertices: list, face: list[int], axis: int | None = None) -> np.ndarray:
+    points = np.asarray([vertices[index] for index in face], dtype=float)
+    if axis is None:
+        axis = int(np.argmax(np.abs(_face_normal(vertices, face)[0])))
+    return np.delete(points, axis, axis=1)
+
+
+def _packed_face_uvs(vertices: list, faces: list[list[int]], normals: list,
+                     face_ids: list[int] | None = None) -> dict[int, list[list[float]]]:
+    """Project each polygon and pack it into a non-overlapping square atlas cell."""
+    selected = list(range(len(faces))) if face_ids is None else sorted(set(face_ids))
+    selected = [face_id for face_id in selected if 0 <= face_id < len(faces)]
+    if not selected:
+        return {}
+    columns = int(np.ceil(np.sqrt(len(selected))))
+    rows = int(np.ceil(len(selected) / columns))
+    cell_width, cell_height = 1.0 / columns, 1.0 / rows
+    padding = min(cell_width, cell_height) * 0.055
+    packed = {}
+    for order, face_id in enumerate(selected):
+        projected = _project_face(vertices, faces[face_id], int(np.argmax(np.abs(normals[face_id]))))
+        uv_min = projected.min(axis=0)
+        uv_size = np.maximum(projected.max(axis=0) - uv_min, 1e-9)
+        available_width = max(cell_width - 2 * padding, 1e-9)
+        available_height = max(cell_height - 2 * padding, 1e-9)
+        scale = min(available_width / uv_size[0], available_height / uv_size[1])
+        shape = uv_size * scale
+        column, row = order % columns, order // columns
+        origin = np.array([column * cell_width, 1.0 - (row + 1) * cell_height])
+        origin += np.array([(cell_width - shape[0]) * 0.5, (cell_height - shape[1]) * 0.5])
+        packed[face_id] = (origin + (projected - uv_min) * scale).tolist()
+    return packed
+
+
+def auto_unwrap_geometry(geometry: dict, face_ids: set[int] | None = None) -> dict:
+    """Regenerate selected islands in their stable, non-overlapping atlas cells."""
+    geometry = ensure_editable_geometry(dict(geometry))
+    selected = set(range(len(geometry["faces"]))) if face_ids is None else set(face_ids)
+    selected = {face_id for face_id in selected if 0 <= face_id < len(geometry["faces"])}
+    # Calculate slots against the complete mesh. Packing only the selected faces
+    # into the whole 0..1 tile made them overlap every untouched island.
+    packed = _packed_face_uvs(geometry["vertices"], geometry["faces"], geometry["face_normals"])
+    face_uvs = list(geometry["face_uvs"])
+    for face_id in selected:
+        face_uvs[face_id] = packed[face_id]
+    geometry["face_uvs"] = face_uvs
+    return geometry
+
+
+def planar_project_geometry(geometry: dict, axis: int = 2, face_ids: set[int] | None = None) -> dict:
+    """Project selected faces onto a shared X, Y, or Z plane."""
+    geometry = ensure_editable_geometry(dict(geometry))
+    axis = int(axis)
+    if axis not in (0, 1, 2):
+        raise ValueError("El eje de proyección debe ser X, Y o Z.")
+    selected = set(range(len(geometry["faces"]))) if face_ids is None else set(face_ids)
+    selected = {face_id for face_id in selected if 0 <= face_id < len(geometry["faces"])}
+    if not selected:
+        return geometry
+    selected_vertices = sorted({vertex for face_id in selected for vertex in geometry["faces"][face_id]})
+    selected_points = np.asarray([geometry["vertices"][index] for index in selected_vertices], dtype=float)
+    projected_selection = np.delete(selected_points, axis, axis=1)
+    uv_min, uv_size = projected_selection.min(axis=0), projected_selection.max(axis=0) - projected_selection.min(axis=0)
+    uv_size = np.maximum(uv_size, 1e-9)
+    face_uvs = list(geometry["face_uvs"])
+    for face_id in selected:
+        projected = _project_face(geometry["vertices"], geometry["faces"][face_id], axis)
+        current = np.asarray(face_uvs[face_id], dtype=float)
+        island_min = current.min(axis=0)
+        island_size = np.maximum(current.max(axis=0) - island_min, 1e-9)
+        face_uvs[face_id] = (island_min + ((projected - uv_min) / uv_size) * island_size).tolist()
+    geometry["face_uvs"] = face_uvs
+    return geometry
+
+
+def transform_face_uvs(geometry: dict, face_ids: set[int], offset=(0.0, 0.0),
+                       scale: float = 1.0, rotation: float = 0.0) -> dict:
+    """Apply an affine scale, rotation, and offset around selected island centers."""
+    geometry = ensure_editable_geometry(dict(geometry))
+    selected = sorted(face_id for face_id in set(face_ids) if 0 <= face_id < len(geometry["face_uvs"]))
+    if not selected:
+        return geometry
+    coordinates = [np.asarray(geometry["face_uvs"][face_id], dtype=float) for face_id in selected]
+    points = np.concatenate(coordinates, axis=0)
+    center = points.mean(axis=0)
+    angle = np.radians(float(rotation))
+    matrix = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]) * float(scale)
+    shift = np.asarray(offset, dtype=float)
+    face_uvs = list(geometry["face_uvs"])
+    for face_id in selected:
+        uv = np.asarray(face_uvs[face_id], dtype=float)
+        face_uvs[face_id] = (center + (uv - center) @ matrix.T + shift).tolist()
+    geometry["face_uvs"] = face_uvs
+    return geometry
 
 
 def _face_normal(vertices: list, face: list[int]) -> tuple[np.ndarray, float]:
@@ -248,12 +341,28 @@ def ensure_editable_geometry(geometry: dict) -> dict:
     old_face_uvs = geometry.get("face_uvs")
     old_face_materials = geometry.get("face_materials")
     rebuilt = _geometry(geometry.get("vertices", []), old_faces)
-    if old_faces == geometry.get("faces"):
-        if isinstance(old_face_uvs, list) and len(old_face_uvs) == len(old_faces):
-            if all(isinstance(uvs, list) and len(uvs) == len(face) for uvs, face in zip(old_face_uvs, old_faces)):
-                rebuilt["face_uvs"] = old_face_uvs
-        if isinstance(old_face_materials, list) and len(old_face_materials) == len(old_faces):
-            rebuilt["face_materials"] = old_face_materials
+    old_face_lookup = {}
+    if isinstance(old_faces, list):
+        for index, face in enumerate(old_faces):
+            if isinstance(face, list) and len(face) >= 3:
+                old_face_lookup[frozenset(face)] = index
+    face_uvs = list(rebuilt["face_uvs"])
+    face_materials = list(rebuilt["face_materials"])
+    for new_index, face in enumerate(rebuilt["faces"]):
+        old_index = old_face_lookup.get(frozenset(face))
+        if old_index is None:
+            continue
+        if isinstance(old_face_uvs, list) and old_index < len(old_face_uvs):
+            old_uvs = old_face_uvs[old_index]
+            old_face = old_faces[old_index]
+            if isinstance(old_uvs, list) and len(old_uvs) == len(old_face):
+                uv_by_vertex = dict(zip(old_face, old_uvs))
+                if all(vertex in uv_by_vertex for vertex in face):
+                    face_uvs[new_index] = [uv_by_vertex[vertex] for vertex in face]
+        if isinstance(old_face_materials, list) and old_index < len(old_face_materials):
+            face_materials[new_index] = old_face_materials[old_index]
+    rebuilt["face_uvs"] = face_uvs
+    rebuilt["face_materials"] = face_materials
     geometry.update(rebuilt)
     return geometry
 

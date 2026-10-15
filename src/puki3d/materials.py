@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
-import mimetypes
+import hashlib
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtCore import QBuffer, QIODevice, Qt
+from PySide6.QtGui import QColor, QImage, QImageReader
 from PySide6.QtWidgets import (
     QAbstractItemView, QColorDialog, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
     QPushButton, QDoubleSpinBox, QVBoxLayout, QWidget,
 )
+
+
+MAX_TEXTURE_SOURCE_BYTES = 24 * 1024 * 1024
+MAX_TEXTURE_BYTES = 12 * 1024 * 1024
+MAX_TEXTURE_LIBRARY_BYTES = 48 * 1024 * 1024
 
 
 DEFAULT_MATERIALS = (
@@ -69,19 +74,66 @@ def import_texture(project_data: dict, path: Path) -> dict:
     suffix = path.suffix.lower()
     if suffix not in {".png", ".jpg", ".jpeg"}:
         raise ValueError("Importa una imagen PNG o JPG.")
-    image = QImage(str(path))
+    if path.stat().st_size > MAX_TEXTURE_SOURCE_BYTES:
+        raise ValueError("La imagen original no puede superar 24 MB.")
+    reader = QImageReader(str(path))
+    dimensions = reader.size()
+    if not dimensions.isValid():
+        raise ValueError("No se pudo leer la imagen seleccionada.")
+    if dimensions.width() > 8192 or dimensions.height() > 8192:
+        raise ValueError("La textura no puede superar 8192 px por lado.")
+    image = reader.read()
     if image.isNull():
         raise ValueError("No se pudo leer la imagen seleccionada.")
     if image.width() > 8192 or image.height() > 8192:
         raise ValueError("La textura no puede superar 8192 × 8192 píxeles.")
-    mime = mimetypes.guess_type(path.name)[0] or ("image/png" if suffix == ".png" else "image/jpeg")
-    raw = path.read_bytes()
-    if len(raw) > 24 * 1024 * 1024:
-        raise ValueError("La textura no puede superar 24 MB.")
+    source = path.read_bytes()
+    digest = hashlib.sha256(source).hexdigest()
+    textures = project_data.setdefault("textures", [])
+    for asset in textures:
+        if asset.get("sha256") == digest:
+            return asset
+        try:
+            existing = base64.b64decode(asset.get("data_base64", ""), validate=True)
+        except (ValueError, TypeError):
+            continue
+        if hashlib.sha256(existing).hexdigest() == digest:
+            asset["sha256"] = digest
+            return asset
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    image_format = "PNG" if suffix == ".png" else "JPEG"
+    image_to_encode = image if suffix == ".png" else image.convertToFormat(QImage.Format.Format_RGB32)
+    if not image_to_encode.save(buffer, image_format, 92 if image_format == "JPEG" else -1):
+        raise ValueError("No se pudo optimizar la imagen seleccionada.")
+    optimized = bytes(buffer.data())
+    raw = optimized if len(optimized) < len(source) else source
+    if len(raw) > MAX_TEXTURE_BYTES:
+        raise ValueError("La textura debe ocupar menos de 12 MB después de optimizarse.")
+    current_size = sum(len(base64.b64decode(asset.get("data_base64", "")))
+                       for asset in textures if asset.get("data_base64"))
+    if current_size + len(raw) > MAX_TEXTURE_LIBRARY_BYTES:
+        raise ValueError("La biblioteca del proyecto no puede superar 48 MB en texturas.")
+    mime = "image/png" if image_format == "PNG" else "image/jpeg"
     asset = {"id": str(uuid4()), "name": path.name, "mime_type": mime,
+             "sha256": digest, "has_alpha": image.hasAlphaChannel() and image_format == "PNG",
              "data_base64": base64.b64encode(raw).decode("ascii")}
-    project_data.setdefault("textures", []).append(asset)
+    textures.append(asset)
     return asset
+
+
+def texture_has_alpha(asset: dict | None) -> bool:
+    """Read alpha metadata, including texture assets written by older versions."""
+    if not asset:
+        return False
+    if isinstance(asset.get("has_alpha"), bool):
+        return asset["has_alpha"]
+    try:
+        raw = base64.b64decode(asset.get("data_base64", ""), validate=True)
+    except (ValueError, TypeError):
+        return False
+    image = QImage.fromData(raw)
+    return not image.isNull() and image.hasAlphaChannel()
 
 
 class MaterialEditorDialog(QDialog):
@@ -293,8 +345,9 @@ class MaterialEditorDialog(QDialog):
                 geometry = node.get("geometry", {})
                 geometry["face_materials"] = [None if value in self._deleted_ids else value
                                                for value in geometry.get("face_materials", [])]
-        used_textures = {material.get("texture_id") for material in self.project_data.get("materials", [])}
-        self.project_data["textures"] = [texture for texture in self.project_data.get("textures", [])
-                                          if texture.get("id") in used_textures]
+        used_texture_ids = {material.get("texture_id") for material in self.project_data.get("materials", [])
+                            if material.get("texture_id")}
+        self.project_data["textures"] = [asset for asset in self.project_data.get("textures", [])
+                                          if asset.get("id") in used_texture_ids]
         super().accept()
 
