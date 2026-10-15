@@ -23,11 +23,22 @@ from puki3d.scene import (
     mirrored_geometry,
     node_matrix,
     primitive_geometry,
+    cylindrical_cutter_geometry,
+    boolean_difference_geometry,
+    node_display_color,
     raycast,
 )
 
 
 class SceneTests(unittest.TestCase):
+    def test_display_color_override_preserves_default_primitive_colors(self) -> None:
+        cube = create_node("cube")
+        self.assertEqual(node_display_color(cube), (0.55, 0.61, 0.69))
+        cube["display_color"] = "#123456"
+        np.testing.assert_allclose(node_display_color(cube), [0x12 / 255, 0x34 / 255, 0x56 / 255])
+        cube["display_color"] = "#GG0000"
+        self.assertEqual(node_display_color(cube), (0.55, 0.61, 0.69))
+
     def test_fill_closes_one_planar_boundary_and_rejects_nonplanar_loop(self) -> None:
         cube = primitive_geometry("cube")
         opened = _geometry(cube["vertices"], cube["faces"][:-1])
@@ -228,6 +239,58 @@ class SceneTests(unittest.TestCase):
         bevel = bevel_geometry(concave, [0], 0.05)
         self.assertTrue(all(len(adjacent) == 2 for adjacent in bevel["edge_faces"]))
         self.assertEqual(len(bevel["triangles"]), sum(len(face) - 2 for face in bevel["faces"]))
+
+    def test_boolean_difference_cuts_a_real_closed_cylindrical_opening(self) -> None:
+        base = primitive_geometry("cube")
+        cutter = cylindrical_cutter_geometry([0, 0, 0], 0.25, axis=1, depth=2.0, segments=12)
+
+        result = boolean_difference_geometry(base, cutter)
+
+        self.assertGreater(len(result["faces"]), len(base["faces"]))
+        self.assertGreater(len(result["vertices"]), len(base["vertices"]))
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in result["edge_faces"]))
+        self.assertEqual([item["code"] for item in mesh_diagnostics(result)], ["closed_manifold"])
+        self.assertTrue(all(len(triangle) == 3 for triangle in result["triangles"]))
+        signed_volume = sum(
+            float(np.dot(result["vertices"][face[0]], np.cross(result["vertices"][face[index]], result["vertices"][face[index + 1]]))) / 6.0
+            for face in result["faces"] for index in range(1, len(face) - 1)
+        )
+        expected_volume = 1.0 - 12 * 0.5 * 0.25**2 * np.sin(2 * np.pi / 12)
+        self.assertAlmostEqual(signed_volume, expected_volume, places=6)
+
+    def test_boolean_difference_rejects_open_inputs_without_changing_them(self) -> None:
+        base = primitive_geometry("cube")
+        opened = _geometry(base["vertices"], base["faces"][:-1])
+        cutter = cylindrical_cutter_geometry([0, 0, 0], 0.25, axis=1, depth=2.0, segments=12)
+        original = [list(face) for face in opened["faces"]]
+
+        with self.assertRaises(MeshTopologyError):
+            boolean_difference_geometry(opened, cutter)
+
+        self.assertEqual(opened["faces"], original)
+
+    def test_boolean_difference_normalizes_closed_inward_facing_inputs(self) -> None:
+        base = primitive_geometry("cube")
+        cutter = cylindrical_cutter_geometry([0, 0, 0], 0.25, axis=1, depth=2.0, segments=12)
+        expected_volume = 1.0 - 12 * 0.5 * 0.25**2 * np.sin(2 * np.pi / 12)
+
+        for reverse_base in (False, True):
+            for reverse_cutter in (False, True):
+                with self.subTest(reverse_base=reverse_base, reverse_cutter=reverse_cutter):
+                    base_faces = [list(reversed(face)) if reverse_base else face for face in base["faces"]]
+                    cutter_faces = [list(reversed(face)) if reverse_cutter else face for face in cutter["faces"]]
+                    result = boolean_difference_geometry(
+                        _geometry(base["vertices"], base_faces),
+                        _geometry(cutter["vertices"], cutter_faces),
+                    )
+                    signed_volume = sum(
+                        float(np.dot(result["vertices"][face[0]], np.cross(result["vertices"][face[index]], result["vertices"][face[index + 1]]))) / 6.0
+                        for face in result["faces"] for index in range(1, len(face) - 1)
+                    )
+
+                    self.assertAlmostEqual(signed_volume, expected_volume, places=6)
+                    self.assertTrue(all(len(adjacent) == 2 for adjacent in result["edge_faces"]))
+                    self.assertEqual([item["code"] for item in mesh_diagnostics(result)], ["closed_manifold"])
 
     def test_mirror_welds_the_center_seam_and_reverses_winding(self) -> None:
         half = _geometry(

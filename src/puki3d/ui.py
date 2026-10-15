@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 from PySide6.QtCore import Qt, QStandardPaths, QSignalBlocker, QTimer
 from PySide6.QtGui import QAction, QColor, QShortcut, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QComboBox,
+    QColorDialog,
     QDoubleSpinBox,
     QDialog,
     QDialogButtonBox,
@@ -33,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from .project import PROJECT_EXTENSION, PROJECT_TYPES, Project, ProjectError
-from .scene import MeshTopologyError, PRIMITIVES, create_node
+from .scene import MeshTopologyError, PRIMITIVES, create_node, ensure_editable_geometry, node_matrix, node_display_color
 from .viewport import SceneViewport
 
 
@@ -394,6 +397,10 @@ class MainWindow(QMainWindow):
         self.bevel_action.setToolTip("Biselar aristas seleccionadas")
         self.bevel_action.triggered.connect(lambda: self.viewport.bevel_selected_edges())
         modeling_menu.addAction(self.bevel_action)
+        self.boolean_action = QAction("Diferencia booleana…", self)
+        self.boolean_action.setToolTip("Recortar el objeto activo usando la malla de otro objeto")
+        self.boolean_action.triggered.connect(self.boolean_difference_selected)
+        modeling_menu.addAction(self.boolean_action)
         modeling_button.setMenu(modeling_menu)
         canvas_toolbar.addWidget(modeling_button)
         topology_button = QToolButton()
@@ -529,8 +536,16 @@ class MainWindow(QMainWindow):
         inspector_layout.addWidget(properties_title)
         self.object_hint = QLabel("Selecciona un objeto")
         self.object_hint.setObjectName("muted")
-        self.object_hint.setContentsMargins(16, 0, 8, 5)
-        inspector_layout.addWidget(self.object_hint)
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(16, 0, 8, 5)
+        hint_row.addWidget(self.object_hint, 1)
+        self.display_color_button = QPushButton()
+        self.display_color_button.setFixedSize(26, 22)
+        self.display_color_button.setToolTip("Color de visor del objeto")
+        self.display_color_button.setAccessibleName("Color de visor del objeto")
+        self.display_color_button.clicked.connect(self.choose_display_color)
+        hint_row.addWidget(self.display_color_button)
+        inspector_layout.addLayout(hint_row)
         self.transform_panel = QWidget()
         self.transform_panel.setObjectName("transformPanel")
         transform_layout = QGridLayout(self.transform_panel)
@@ -618,6 +633,7 @@ class MainWindow(QMainWindow):
         self.fill_action.setEnabled(mode == "edit" and component in {"vertex", "edge"} and bool(self.viewport.selected_node))
         self.bridge_action.setEnabled(mode == "edit" and component in {"vertex", "edge"} and bool(self.viewport.selected_node))
         self.merge_action.setEnabled(mode == "edit" and component == "vertex" and bool(self.viewport.selected_node))
+        self.boolean_action.setEnabled(mode == "object" and bool(self.viewport.selected_node))
         self._sync_mirror_controls(self.viewport.selected_node)
         if self.viewport.insetting:
             self.edit_status.setText("INSET \u00b7 Arrastra a la derecha para ajustar \u00b7 Enter confirma \u00b7 Esc cancela")
@@ -715,6 +731,7 @@ class MainWindow(QMainWindow):
 
     def _update_transform_fields(self, node) -> None:
         self.transform_panel.setEnabled(bool(node))
+        self.display_color_button.setEnabled(bool(node))
         self.object_hint.setText(node.get("name", "Objeto") if node else "Selecciona un objeto")
         for key, fields in self.transform_fields.items():
             values = node.get("transform", {}).get(key, [1, 1, 1] if key == "scale" else [0, 0, 0]) if node else ([1, 1, 1] if key == "scale" else [0, 0, 0])
@@ -722,6 +739,20 @@ class MainWindow(QMainWindow):
                 blocker = QSignalBlocker(field)
                 field.setValue(float(value))
                 del blocker
+        color = node_display_color(node) if node else (0.32, 0.35, 0.40)
+        self.display_color_button.setStyleSheet(f"background-color: {QColor.fromRgbF(*color).name()}; color: #f2f3f5;")
+
+    def choose_display_color(self) -> None:
+        node = self.viewport.selected_node
+        if not node:
+            return
+        selected = QColorDialog.getColor(QColor.fromRgbF(*node_display_color(node)), self, "Color de visor")
+        if not selected.isValid():
+            return
+        node["display_color"] = selected.name().upper()
+        self._update_transform_fields(node)
+        self.viewport.update()
+        self._mark_project_dirty()
 
     def _apply_inspector_transform(self) -> None:
         node = self.viewport.selected_node
@@ -778,6 +809,34 @@ class MainWindow(QMainWindow):
         selected["name"] = name
         self._refresh_outliner(selected["id"])
         self._mark_project_dirty()
+
+    def boolean_difference_selected(self) -> None:
+        target = self.viewport.selected_node
+        if not target or self.viewport.mode != "object":
+            return
+        candidates = [node for node in self._active_scene_nodes() if node.get("id") != target.get("id")]
+        if not candidates:
+            QMessageBox.information(self, "Diferencia booleana", "Añade otra malla para usarla como cortadora.")
+            return
+        labels = [node.get("name", "Objeto") for node in candidates]
+        label, accepted = QInputDialog.getItem(self, "Diferencia booleana", "Cortadora", labels, 0, False)
+        if not accepted:
+            return
+        cutter = candidates[labels.index(label)]
+        try:
+            source = ensure_editable_geometry(cutter.get("geometry", {}))
+            relative = np.linalg.inv(node_matrix(target)) @ node_matrix(cutter)
+            cutter_local = {
+                **source,
+                "vertices": [(relative @ np.append(np.asarray(point, dtype=float), 1.0))[:3].tolist()
+                             for point in source["vertices"]],
+            }
+            ensure_editable_geometry(cutter_local)
+        except (MeshTopologyError, np.linalg.LinAlgError, ValueError) as exc:
+            QMessageBox.warning(self, "Diferencia booleana", f"No se pudo preparar la cortadora: {exc}")
+            return
+        if self.viewport.apply_boolean_difference(cutter_local):
+            self._mark_project_dirty()
 
     def delete_selected(self) -> None:
         if self.viewport.mode == "edit":

@@ -12,11 +12,12 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QToolButton
 
 from puki3d.project import Project
-from puki3d.scene import _geometry, node_matrix
+from puki3d.scene import _geometry, node_matrix, primitive_geometry, cylindrical_cutter_geometry
 from puki3d.ui import MainWindow
 from puki3d.viewport import _silhouette_edge_ids, _snap_axis_amount
 
@@ -54,6 +55,17 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.window.viewport.select_node(None)
         self.assertEqual(self.window.outliner.currentRow(), -1)
         self.assertFalse(self.window.transform_panel.isEnabled())
+
+    def test_object_viewport_color_uses_inspector_and_persists(self) -> None:
+        self.window.add_primitive("cube")
+        node = self.window.viewport.selected_node
+        self.assertTrue(self.window.display_color_button.isEnabled())
+        with patch("puki3d.ui.QColorDialog.getColor", return_value=QColor("#123456")):
+            self.window.choose_display_color()
+        self.assertEqual(node["display_color"], "#123456")
+        self.project.save()
+        reopened = Project.load(self.project.path)
+        self.assertEqual(reopened.data["scenes"][0]["nodes"][0]["display_color"], "#123456")
 
     def test_modeling_tools_are_grouped_and_enabled_for_the_active_component_mode(self) -> None:
         grouped_tools = {button.text() for button in self.window.findChildren(QToolButton)}
@@ -513,6 +525,40 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(node["geometry"]["vertices"][4][0], 0.5)
         viewport.undo_edit()
         self.assertEqual(node["geometry"]["vertices"][4][0], -0.5)
+
+    def test_boolean_cut_is_undoable_and_redoable_from_object_mode(self) -> None:
+        self.window.add_primitive("cube")
+        node = self.window.viewport.selected_node
+        before = copy.deepcopy(node["geometry"])
+        cutter = cylindrical_cutter_geometry([0, 0, 0], 0.25, axis=1, depth=2.0, segments=12)
+
+        self.window.viewport.apply_boolean_difference(cutter)
+        after = copy.deepcopy(node["geometry"])
+        self.assertNotEqual(after, before)
+        self.window.viewport.undo_edit()
+        self.assertEqual(node["geometry"], before)
+        self.window.viewport.redo_edit()
+        self.assertEqual(node["geometry"], after)
+        self.project.save()
+        reopened = Project.load(self.project.path)
+        self.assertEqual(reopened.data["scenes"][0]["nodes"][0]["geometry"], after)
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in reopened.data["scenes"][0]["nodes"][0]["geometry"]["edge_faces"]))
+
+    def test_boolean_difference_menu_uses_other_object_transform(self) -> None:
+        self.window.add_primitive("cube")
+        target = self.window.viewport.selected_node
+        self.window.add_primitive("cylinder")
+        cutter = self.window.viewport.selected_node
+        cutter["name"] = "Cortadora"
+        cutter["transform"].update({"position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": [0.25, 0.25, 2.0]})
+        self.window.viewport.select_node(target["id"])
+        original = copy.deepcopy(target["geometry"])
+
+        with patch("puki3d.ui.QInputDialog.getItem", return_value=("Cortadora", True)):
+            self.window.boolean_difference_selected()
+
+        self.assertNotEqual(target["geometry"], original)
+        self.assertTrue(all(len(adjacent) == 2 for adjacent in target["geometry"]["edge_faces"]))
 
     def test_axis_drag_is_independent_starts_without_jump_and_can_be_cancelled(self) -> None:
         self.window.add_primitive("cube")

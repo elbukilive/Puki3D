@@ -15,6 +15,22 @@ PRIMITIVES = {
     "plane": "Plano",
 }
 
+DEFAULT_NODE_COLORS = {
+    "cube": (0.55, 0.61, 0.69), "sphere": (0.63, 0.68, 0.75),
+    "cylinder": (0.58, 0.65, 0.72), "plane": (0.45, 0.50, 0.57),
+}
+
+
+def node_display_color(node: dict) -> tuple[float, float, float]:
+    """Resolve a mesh's optional viewport color, preserving legacy defaults."""
+    color = node.get("display_color")
+    if isinstance(color, str) and len(color) == 7 and color.startswith("#"):
+        try:
+            return tuple(int(color[index:index + 2], 16) / 255.0 for index in (1, 3, 5))
+        except ValueError:
+            pass
+    return DEFAULT_NODE_COLORS.get(node.get("primitive"), DEFAULT_NODE_COLORS["cube"])
+
 
 class MeshTopologyError(ValueError):
     """Raised when polygon data cannot form a valid editable surface."""
@@ -34,14 +50,10 @@ def primitive_geometry(primitive: str) -> dict:
     if primitive == "cylinder":
         segments = 32
         vertices = [[cos(2 * pi * i / segments) * 0.5, sin(2 * pi * i / segments) * 0.5, z] for z in (-0.5, 0.5) for i in range(segments)]
-        bottom_center, top_center = len(vertices), len(vertices) + 1
-        vertices.extend([[0, 0, -0.5], [0, 0, 0.5]])
-        faces = []
+        faces = [list(reversed(range(segments))), list(range(segments, 2 * segments))]
         for i in range(segments):
             nxt = (i + 1) % segments
             faces.append((i, nxt, segments + nxt, segments + i))
-            faces.append((bottom_center, nxt, i))
-            faces.append((top_center, segments + i, segments + nxt))
         return _mesh(vertices, faces)
     if primitive == "sphere":
         segments, rings = 24, 12
@@ -675,6 +687,283 @@ def inset_face_geometry(geometry: dict, face_id: int, amount: float) -> dict:
     for i, (start, end) in enumerate(zip(face, face[1:] + face[:1])):
         new_faces.append([start, end, inner_ids[(i + 1) % len(face)], inner_ids[i]])
     return _geometry(new_vertices, new_faces)
+
+
+def boolean_difference_geometry(target: dict, cutter: dict, tolerance: float | None = None) -> dict:
+    """Subtract a closed cutter mesh from a closed target mesh using BSP clipping.
+
+    The operation is intentionally conservative: both inputs and the result must
+    be closed two-manifold surfaces. Invalid, touching, or collapsed results are
+    rejected before the caller replaces its editable mesh.
+    """
+    target = ensure_editable_geometry(dict(target))
+    cutter = ensure_editable_geometry(dict(cutter))
+    for label, geometry in (("base", target), ("cortadora", cutter)):
+        if not geometry["faces"] or any(len(adjacent) != 2 for adjacent in geometry["edge_faces"]):
+            raise MeshTopologyError(f"La malla {label} debe estar cerrada y ser manifold para Diferencia.")
+        if any(item["severity"] == "warning" for item in mesh_diagnostics(geometry)):
+            raise MeshTopologyError(f"La malla {label} tiene problemas topológicos; Diferencia se canceló.")
+
+    def signed_volume(geometry: dict) -> float:
+        points = np.asarray(geometry["vertices"], dtype=float)
+        volume = 0.0
+        for face in geometry["faces"]:
+            anchor = points[face[0]]
+            for index in range(1, len(face) - 1):
+                volume += float(np.dot(anchor, np.cross(points[face[index]], points[face[index + 1]]))) / 6.0
+        return volume
+
+    # Edge winding checks catch local inconsistencies, but a consistently
+    # inward-facing closed shell passes them. Normalize both solids before BSP
+    # clipping, whose inside/outside classification depends on outward normals.
+    if abs(signed_volume(target)) <= 1e-12 or abs(signed_volume(cutter)) <= 1e-12:
+        raise MeshTopologyError("Diferencia requiere sólidos cerrados con volumen válido.")
+    if signed_volume(target) < 0:
+        target = _geometry(target["vertices"], [list(reversed(face)) for face in target["faces"]])
+    if signed_volume(cutter) < 0:
+        cutter = _geometry(cutter["vertices"], [list(reversed(face)) for face in cutter["faces"]])
+    all_points = np.asarray(target["vertices"] + cutter["vertices"], dtype=float)
+    scale = max(float(np.max(np.ptp(all_points, axis=0))), 1.0)
+    eps = float(tolerance if tolerance is not None else scale * 1e-7)
+    if not np.isfinite(eps) or eps <= 0:
+        raise MeshTopologyError("La tolerancia de Diferencia debe ser positiva.")
+
+    class Plane:
+        def __init__(self, normal: np.ndarray, offset: float):
+            self.normal, self.offset = normal, offset
+
+        @classmethod
+        def from_points(cls, points):
+            normal, area = _face_normal(points, list(range(len(points))))
+            if area <= eps:
+                raise MeshTopologyError("Diferencia encontró una cara degenerada.")
+            normal = np.asarray(normal, dtype=float)
+            return cls(normal, float(np.dot(normal, points[0])))
+
+        def flipped(self):
+            return Plane(-self.normal, -self.offset)
+
+        def split(self, polygon, coplanar_front, coplanar_back, front, back):
+            COPLANAR, FRONT, BACK, SPANNING = 0, 1, 2, 3
+            types = []
+            polygon_type = 0
+            for vertex in polygon.vertices:
+                distance = float(np.dot(self.normal, vertex) - self.offset)
+                kind = FRONT if distance > eps else BACK if distance < -eps else COPLANAR
+                polygon_type |= kind
+                types.append(kind)
+            if polygon_type == COPLANAR:
+                (coplanar_front if float(np.dot(self.normal, polygon.plane.normal)) > 0 else coplanar_back).append(polygon)
+            elif polygon_type == FRONT:
+                front.append(polygon)
+            elif polygon_type == BACK:
+                back.append(polygon)
+            else:
+                front_vertices, back_vertices = [], []
+                for index, vertex in enumerate(polygon.vertices):
+                    following = (index + 1) % len(polygon.vertices)
+                    next_vertex = polygon.vertices[following]
+                    kind, next_kind = types[index], types[following]
+                    if kind != BACK:
+                        front_vertices.append(vertex)
+                    if kind != FRONT:
+                        back_vertices.append(vertex)
+                    if (kind | next_kind) == SPANNING:
+                        direction = next_vertex - vertex
+                        denominator = float(np.dot(self.normal, direction))
+                        if abs(denominator) <= eps:
+                            continue
+                        factor = (self.offset - float(np.dot(self.normal, vertex))) / denominator
+                        intersection = vertex + direction * factor
+                        front_vertices.append(intersection)
+                        back_vertices.append(intersection.copy())
+                for vertices, destination in ((front_vertices, front), (back_vertices, back)):
+                    cleaned = []
+                    for vertex in vertices:
+                        if not cleaned or np.linalg.norm(vertex - cleaned[-1]) > eps:
+                            cleaned.append(vertex)
+                    if len(cleaned) > 1 and np.linalg.norm(cleaned[0] - cleaned[-1]) <= eps:
+                        cleaned.pop()
+                    if len(cleaned) >= 3:
+                        destination.append(Polygon(cleaned))
+
+    class Polygon:
+        def __init__(self, vertices):
+            self.vertices = [np.asarray(vertex, dtype=float) for vertex in vertices]
+            self.plane = Plane.from_points(self.vertices)
+
+        def flipped(self):
+            return Polygon(list(reversed(self.vertices)))
+
+    class Node:
+        def __init__(self, polygons=None):
+            self.plane = None
+            self.front = self.back = None
+            self.polygons = []
+            if polygons:
+                self.build(polygons)
+
+        def clone(self):
+            result = Node()
+            result.plane = self.plane
+            result.front = self.front.clone() if self.front else None
+            result.back = self.back.clone() if self.back else None
+            result.polygons = list(self.polygons)
+            return result
+
+        def invert(self):
+            self.polygons = [polygon.flipped() for polygon in self.polygons]
+            if self.plane:
+                self.plane = self.plane.flipped()
+            if self.front:
+                self.front.invert()
+            if self.back:
+                self.back.invert()
+            self.front, self.back = self.back, self.front
+
+        def clip_polygons(self, polygons):
+            if self.plane is None:
+                return list(polygons)
+            front, back = [], []
+            for polygon in polygons:
+                self.plane.split(polygon, front, back, front, back)
+            if self.front:
+                front = self.front.clip_polygons(front)
+            if self.back:
+                back = self.back.clip_polygons(back)
+            else:
+                back = []
+            return front + back
+
+        def clip_to(self, other):
+            self.polygons = other.clip_polygons(self.polygons)
+            if self.front:
+                self.front.clip_to(other)
+            if self.back:
+                self.back.clip_to(other)
+
+        def all_polygons(self):
+            result = list(self.polygons)
+            if self.front:
+                result.extend(self.front.all_polygons())
+            if self.back:
+                result.extend(self.back.all_polygons())
+            return result
+
+        def build(self, polygons):
+            if not polygons:
+                return
+            if self.plane is None:
+                self.plane = polygons[0].plane
+            front, back = [], []
+            for polygon in polygons:
+                self.plane.split(polygon, self.polygons, self.polygons, front, back)
+            if front:
+                if self.front is None:
+                    self.front = Node()
+                self.front.build(front)
+            if back:
+                if self.back is None:
+                    self.back = Node()
+                self.back.build(back)
+
+    def polygons_from(geometry):
+        return [Polygon([geometry["vertices"][index] for index in face]) for face in geometry["faces"]]
+
+    a, b = Node(polygons_from(target)), Node(polygons_from(cutter))
+    a.invert()
+    a.clip_to(b)
+    b.clip_to(a)
+    b.invert()
+    b.clip_to(a)
+    b.invert()
+    a.build(b.all_polygons())
+    a.invert()
+    polygons = a.all_polygons()
+    if not polygons:
+        raise MeshTopologyError("La Diferencia eliminaría por completo la malla base.")
+
+    vertices, faces, lookup = [], [], {}
+    quantum = max(eps, 1e-10)
+    for polygon in polygons:
+        face = []
+        for point in polygon.vertices:
+            key = tuple(int(round(float(value) / quantum)) for value in point)
+            if key not in lookup:
+                lookup[key] = len(vertices)
+                vertices.append(point.tolist())
+            vertex_id = lookup[key]
+            if not face or face[-1] != vertex_id:
+                face.append(vertex_id)
+        if len(face) > 1 and face[0] == face[-1]:
+            face.pop()
+        if len(set(face)) >= 3:
+            faces.append(face)
+    # BSP fragments can leave a long edge opposite several shorter coplanar
+    # edges. Split those long edges at every welded vertex before building the
+    # shared-edge table so the result has a consistent manifold topology.
+    points = np.asarray(vertices, dtype=float)
+    conformed_faces = []
+    for face in faces:
+        conformed = []
+        for start_id, end_id in zip(face, face[1:] + face[:1]):
+            start, end = points[start_id], points[end_id]
+            direction = end - start
+            length_squared = float(np.dot(direction, direction))
+            insertions = []
+            if length_squared > eps * eps:
+                for candidate_id, candidate in enumerate(points):
+                    if candidate_id in (start_id, end_id):
+                        continue
+                    fraction = float(np.dot(candidate - start, direction) / length_squared)
+                    if eps / np.sqrt(length_squared) < fraction < 1.0 - eps / np.sqrt(length_squared):
+                        closest = start + direction * fraction
+                        if np.linalg.norm(candidate - closest) <= eps * 2:
+                            insertions.append((fraction, candidate_id))
+            conformed.append(start_id)
+            conformed.extend(candidate for _, candidate in sorted(insertions))
+        conformed_faces.append(conformed)
+    faces = conformed_faces
+    try:
+        result = _geometry(vertices, faces)
+    except (IndexError, MeshTopologyError, ValueError) as exc:
+        raise MeshTopologyError("Diferencia generó una malla degenerada; se conservó la original.") from exc
+    if not result["faces"] or any(len(adjacent) != 2 for adjacent in result["edge_faces"]):
+        boundary = sum(len(adjacent) == 1 for adjacent in result["edge_faces"])
+        nonmanifold = sum(len(adjacent) > 2 for adjacent in result["edge_faces"])
+        raise MeshTopologyError(f"Diferencia generó una superficie no manifold ({boundary} bordes abiertos, {nonmanifold} aristas compartidas de más de dos caras); se conservó la original.")
+    if any(item["severity"] == "warning" for item in mesh_diagnostics(result)):
+        raise MeshTopologyError("Diferencia generó una topología inválida; se conservó la original.")
+    result_volume = signed_volume(result)
+    if abs(result_volume) <= eps ** 3:
+        raise MeshTopologyError("Diferencia produjo un volumen nulo; se conservó la original.")
+    if result_volume < 0:
+        result = _geometry(result["vertices"], [list(reversed(face)) for face in result["faces"]])
+    return result
+
+
+def cylindrical_cutter_geometry(center: list[float], radius: float, axis: int, depth: float, segments: int = 16) -> dict:
+    """Build a low-poly cylindrical cutting volume along one local axis."""
+    if axis not in (0, 1, 2) or not np.isfinite(radius) or radius <= 0 or not np.isfinite(depth) or depth <= 0:
+        raise MeshTopologyError("La cortadora requiere eje válido, radio y profundidad positivos.")
+    if segments < 6 or segments > 64:
+        raise MeshTopologyError("La cortadora cilíndrica requiere entre 6 y 64 segmentos.")
+    center = np.asarray(center, dtype=float)
+    if center.shape != (3,) or not np.all(np.isfinite(center)):
+        raise MeshTopologyError("El centro de la cortadora debe tener tres coordenadas finitas.")
+    other_axes = [index for index in range(3) if index != axis]
+    vertices = []
+    for offset in (-depth / 2, depth / 2):
+        for segment in range(segments):
+            angle = 2 * pi * segment / segments
+            point = center.copy()
+            point[axis] += offset
+            point[other_axes[0]] += radius * cos(angle)
+            point[other_axes[1]] += radius * sin(angle)
+            vertices.append(point.tolist())
+    faces = [list(reversed(range(segments))), list(range(segments, 2 * segments))]
+    faces.extend([[i, (i + 1) % segments, (i + 1) % segments + segments, i + segments] for i in range(segments)])
+    return _geometry(vertices, faces)
 
 
 def mirrored_geometry(geometry: dict, axis: int, tolerance: float = 1e-6) -> tuple[dict, dict]:

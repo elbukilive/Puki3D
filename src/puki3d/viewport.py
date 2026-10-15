@@ -40,7 +40,9 @@ from .scene import (
     inset_face_geometry,
     loop_cut_geometry,
     mirrored_geometry,
+    boolean_difference_geometry,
     node_matrix,
+    node_display_color,
     raycast,
 )
 
@@ -246,6 +248,23 @@ class SceneViewport(QOpenGLWidget):
         self._record_geometry_change(before)
         self.update()
         self.statusMessage.emit(self._topology_status(node))
+
+    def apply_boolean_difference(self, cutter_geometry: dict) -> bool:
+        """Replace the active object's mesh with a validated Boolean difference."""
+        node = self.selected_node
+        if node is None or self.mode != "object":
+            self.statusMessage.emit("Diferencia requiere un objeto activo en Object Mode.")
+            return False
+        before = self._snapshot_geometry()
+        try:
+            node["geometry"] = boolean_difference_geometry(before, cutter_geometry)
+        except MeshTopologyError as exc:
+            self.statusMessage.emit(str(exc))
+            return False
+        self.selected_components.clear()
+        self._record_geometry_change(before)
+        self.update()
+        return True
 
     def _topology_status(self, node: dict) -> str:
         diagnostics = mesh_diagnostics(node.get("geometry", {}))
@@ -892,10 +911,6 @@ class SceneViewport(QOpenGLWidget):
         glEnable(GL_LIGHTING)
 
     def _draw_nodes(self) -> None:
-        colors = {
-            "cube": (0.55, 0.61, 0.69), "sphere": (0.63, 0.68, 0.75),
-            "cylinder": (0.58, 0.65, 0.72), "plane": (0.45, 0.50, 0.57),
-        }
         for node in self.nodes:
             try:
                 geometry, _ = self._evaluated_geometry(node)
@@ -907,7 +922,7 @@ class SceneViewport(QOpenGLWidget):
                 continue
             glPushMatrix()
             glMultMatrixf(np.asarray(node_matrix(node).T, dtype=np.float32))
-            glColor3f(*colors.get(node.get("primitive"), colors["cube"]))
+            glColor3f(*node_display_color(node))
             glBegin(GL_TRIANGLES)
             for triangle in triangles:
                 a, b, c = (np.asarray(vertices[index], dtype=float) for index in triangle)
