@@ -45,6 +45,7 @@ from .scene import (
     node_display_color,
     raycast,
 )
+from .vehicle import mount_point_world_position, vehicle_preview_node_matrix
 
 
 def _silhouette_edge_ids(geometry: dict, eye_local: np.ndarray) -> list[int]:
@@ -121,6 +122,10 @@ class SceneViewport(QOpenGLWidget):
         self._hover_axis: int | None = None
         self._orbiting = False
         self._panning = False
+        self.vehicle_system: dict | None = None
+        self.show_locators = True
+        self.selected_locator_id: str | None = None
+        self.vehicle_preview = {"active": False, "steering": 0.0, "wheel_rotation": 0.0, "suspension": 0.0}
 
     @property
     def selected_node(self) -> dict | None:
@@ -132,6 +137,36 @@ class SceneViewport(QOpenGLWidget):
             self.selected_id = None
             self.selectionChanged.emit(None)
         self.update()
+
+    def set_vehicle_system(self, vehicle_system: dict | None) -> None:
+        self.vehicle_system = deepcopy(vehicle_system) if vehicle_system else None
+        valid_ids = {point.get("id") for point in (self.vehicle_system or {}).get("mount_points", [])}
+        if self.selected_locator_id not in valid_ids:
+            self.selected_locator_id = None
+        self.update()
+
+    def set_vehicle_preview(self, active: bool, steering: float = 0.0,
+                            wheel_rotation: float = 0.0, suspension: float = 0.0) -> None:
+        self.vehicle_preview = {"active": bool(active), "steering": float(steering),
+                                "wheel_rotation": float(wheel_rotation), "suspension": float(suspension)}
+        self.update()
+
+    def set_locators_visible(self, visible: bool) -> None:
+        self.show_locators = bool(visible)
+        self.update()
+
+    def _pick_locator(self, point: QPoint) -> dict | None:
+        if not self.show_locators or not self.vehicle_system:
+            return None
+        closest = None
+        for locator in self.vehicle_system.get("mount_points", []):
+            screen = self._project(mount_point_world_position(locator, self.nodes))
+            if screen is None:
+                continue
+            distance = float(np.linalg.norm(screen - np.array([point.x(), point.y()], dtype=float)))
+            if distance <= 14 and (closest is None or distance < closest[0]):
+                closest = (distance, locator)
+        return closest[1] if closest else None
 
     def select_node(self, node_id: str | None) -> None:
         if node_id != self.selected_id:
@@ -881,6 +916,7 @@ class SceneViewport(QOpenGLWidget):
         glLightfv(GL_LIGHT0, 0x1203, [eye[0], eye[1], eye[2], 1.0])  # GL_POSITION
         self._draw_grid()
         self._draw_nodes()
+        self._draw_locators()
         selected = self.selected_node
         if selected:
             self._draw_selection(selected, right, camera_up)
@@ -911,6 +947,10 @@ class SceneViewport(QOpenGLWidget):
         glEnable(GL_LIGHTING)
 
     def _draw_nodes(self) -> None:
+        vehicle = self.vehicle_system or {}
+        steering = vehicle.get("steering", {}).get("max_angle", 35.0)
+        travel = vehicle.get("suspension", {}).get("travel", 0.25)
+        preview = self.vehicle_preview
         for node in self.nodes:
             try:
                 geometry, _ = self._evaluated_geometry(node)
@@ -921,7 +961,12 @@ class SceneViewport(QOpenGLWidget):
             if not vertices or not triangles:
                 continue
             glPushMatrix()
-            glMultMatrixf(np.asarray(node_matrix(node).T, dtype=np.float32))
+            matrix = node_matrix(node)
+            if preview["active"]:
+                matrix = vehicle_preview_node_matrix(
+                    node, preview["steering"], preview["wheel_rotation"], preview["suspension"], steering, travel
+                )
+            glMultMatrixf(np.asarray(matrix.T, dtype=np.float32))
             glColor3f(*node_display_color(node))
             glBegin(GL_TRIANGLES)
             for triangle in triangles:
@@ -936,6 +981,26 @@ class SceneViewport(QOpenGLWidget):
                     glVertex3f(float(point[0]), float(point[1]), float(point[2]))
             glEnd()
             glPopMatrix()
+
+    def _draw_locators(self) -> None:
+        if not self.show_locators or not self.vehicle_system:
+            return
+        locators = self.vehicle_system.get("mount_points", [])
+        if not locators:
+            return
+        glDisable(GL_LIGHTING)
+        glPointSize(11.0)
+        glBegin(GL_POINTS)
+        for locator in locators:
+            if locator.get("id") == self.selected_locator_id:
+                glColor3f(1.0, 0.72, 0.18)
+            else:
+                glColor3f(0.25, 0.92, 0.82)
+            point = mount_point_world_position(locator, self.nodes)
+            glVertex3f(float(point[0]), float(point[1]), float(point[2]))
+        glEnd()
+        glPointSize(1.0)
+        glEnable(GL_LIGHTING)
 
     def _draw_selection(self, node: dict, camera_right: np.ndarray, camera_up: np.ndarray) -> None:
         try:
@@ -1244,6 +1309,14 @@ class SceneViewport(QOpenGLWidget):
                     self._dragging_transform = True
                     event.accept()
                     return
+            locator = self._pick_locator(self._last_mouse)
+            if locator:
+                self.selected_locator_id = locator.get("id")
+                self.statusMessage.emit(f"Mount point: {locator.get('name', 'Mount Point')}")
+                self.update()
+                event.accept()
+                return
+            self.selected_locator_id = None
             hit_id = self._pick(self._last_mouse)
             if self.mode == "edit" and hit_id == self.selected_id and self.selected_node:
                 component = self._pick_component(self._last_mouse)

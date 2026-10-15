@@ -6,13 +6,19 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
 from puki3d.project import Project
-from puki3d.vehicle import auto_classify, vehicle_diagnostics
+from puki3d.vehicle import (
+    axle_dimensions, auto_classify, mount_point_world_position,
+    vehicle_diagnostics, vehicle_preview_node_matrix,
+)
 from puki3d.vehicle_ui import VehicleSystemDialog
+from puki3d.vehicle_preview import VehiclePreviewDialog
 
 
 def sample_nodes():
@@ -70,12 +76,13 @@ class VehicleModelTests(unittest.TestCase):
                         {"name": "Front plate", "type": "Plate", "position": [2.3, 0.0, 0.4]},
                     ]}}
         dialog = VehicleSystemDialog(original, nodes, nodes[0]["id"])
-        self.assertEqual(dialog.mounts_table.cellWidget(0, 2).value(), 2.3)
-        self.assertEqual(dialog.mounts_table.cellWidget(0, 4).value(), 0.4)
+        self.assertEqual(dialog.mounts_table.cellWidget(0, 3).value(), 2.3)
+        self.assertEqual(dialog.mounts_table.cellWidget(0, 5).value(), 0.4)
         dialog._suggest_classifications()
         self.assertEqual(sum(n.get("vehicle", {}).get("role") == "wheel" for n in dialog.nodes), 4)
         dialog.add_mount_point()
-        self.assertEqual(dialog.meta["mount_points"][1]["position"], nodes[0]["transform"]["position"])
+        self.assertEqual(dialog.meta["mount_points"][1]["attached_node_id"], nodes[0]["id"])
+        self.assertEqual(dialog.meta["mount_points"][1]["position"], [0.0, 0.0, 0.0])
         dialog.mounts_table.item(0, 0).setText("Front plate")
         dialog.mounts_table.cellWidget(0, 1).setCurrentText("Plate")
         dialog.accept()
@@ -99,6 +106,92 @@ class VehicleModelTests(unittest.TestCase):
             reopened = Project.load(project.path)
             self.assertEqual(reopened.data["vehicle_system"], expected)
             self.assertEqual(reopened.data["scenes"][0]["nodes"][3]["vehicle"]["wheel"]["radius"], 0.4)
+
+
+    def test_axle_dimensions_are_derived_from_configured_wheel_centers(self):
+        nodes = sample_nodes()
+        auto_classify(nodes)
+        dimensions = axle_dimensions(nodes)
+        self.assertAlmostEqual(dimensions["wheelbase"], 2.7)
+        self.assertAlmostEqual(dimensions["front_track"], 1.8)
+        self.assertAlmostEqual(dimensions["rear_track"], 1.8)
+
+    def test_preview_matrix_moves_and_rotates_wheels_without_changing_saved_transform(self):
+        node = sample_nodes()[3]
+        auto_classify([node])
+        original = copy.deepcopy(node["transform"])
+        straight = vehicle_preview_node_matrix(node)
+        angled = vehicle_preview_node_matrix(node, steering_angle=0.5, max_steering_angle=40)
+        lifted = vehicle_preview_node_matrix(node, suspension_fraction=1, suspension_travel=0.2)
+        self.assertNotEqual(angled[:3, :3].tolist(), straight[:3, :3].tolist())
+        np.testing.assert_allclose(lifted[:3, 3], np.asarray(straight[:3, 3]) + [0, 0, 0.2])
+        self.assertEqual(node["transform"], original)
+
+    def test_mount_point_follows_attached_component_transform(self):
+        node = sample_nodes()[0]
+        point = {"position": [0.25, 0.0, 0.0], "attached_node_id": node["id"]}
+        np.testing.assert_allclose(mount_point_world_position(point, [node]), [0.2, 0.0, 0.3])
+
+    def test_wheel_orientation_drive_steering_and_axle_controls_are_editable(self):
+        nodes = sample_nodes()
+        auto_classify(nodes)
+        dialog = VehicleSystemDialog({"project": {"name": "Pickup"}}, nodes)
+        self.assertIn("Distancia entre ejes: 2.700 m", dialog.axle_metrics.text())
+        self.assertEqual(dialog.max_steering.value(), 35.0)
+        self.assertEqual(dialog.suspension_travel.value(), 0.25)
+        dialog.wheels_table.cellWidget(0, 6).setValue(15.0)
+        dialog.wheels_table.cellWidget(0, 11).setChecked(True)
+        dialog.wheels_table.cellWidget(1, 12).setChecked(True)
+        dialog.suspension_travel.setValue(0.35)
+        dialog.max_steering.setValue(38.0)
+        self.assertEqual(dialog.nodes[3]["transform"]["rotation"][2], 15.0)
+        self.assertTrue(dialog.nodes[3]["vehicle"]["wheel"]["steerable"])
+        self.assertTrue(dialog.nodes[4]["vehicle"]["wheel"]["driven"])
+        self.assertEqual(dialog.meta["suspension"]["travel"], 0.35)
+        self.assertEqual(dialog.meta["steering"]["max_angle"], 38.0)
+
+    def test_locator_can_be_attached_to_component_and_uses_local_coordinates(self):
+        nodes = sample_nodes()
+        data = {"project": {"name": "Pickup"}, "vehicle_system": {"mount_points": [
+            {"id": "loc-1", "name": "Mirror left", "type": "Mirror", "position": [0.2, 0, 0],
+             "rotation": [0, 0, 0], "attached_node_id": "node-0"},
+        ]}}
+        dialog = VehicleSystemDialog(data, nodes, selected_mount_id="loc-1")
+        self.assertEqual(dialog.mounts_table.currentRow(), 0)
+        attached = dialog.mounts_table.cellWidget(0, 2)
+        self.assertEqual(attached.currentData(), "node-0")
+        np.testing.assert_allclose(mount_point_world_position(dialog.meta["mount_points"][0], nodes), [0.16, 0, 0.3])
+
+    def test_changing_locator_attachment_preserves_its_world_position(self):
+        nodes = sample_nodes()
+        data = {"project": {"name": "Pickup"}, "vehicle_system": {"mount_points": [
+            {"id": "loc-1", "name": "Front plate", "type": "Plate", "position": [1.0, 0.0, 0.5]},
+        ]}}
+        dialog = VehicleSystemDialog(data, nodes)
+        target = dialog.mounts_table.cellWidget(0, 2)
+        target.setCurrentIndex(target.findData("node-0"))
+        point = dialog.meta["mount_points"][0]
+        np.testing.assert_allclose(mount_point_world_position(point, dialog.nodes), [1.0, 0.0, 0.5])
+        target.setCurrentIndex(target.findData(None))
+        np.testing.assert_allclose(point["position"], [1.0, 0.0, 0.5])
+
+    def test_preview_controls_are_temporary_and_reset_when_closed(self):
+        class PreviewViewport:
+            state = None
+
+            def set_vehicle_preview(self, active, **values):
+                self.state = {"active": active, **values}
+
+        viewport = PreviewViewport()
+        config = {"steering": {"max_angle": 40}, "suspension": {"travel": 0.3}}
+        dialog = VehiclePreviewDialog(viewport, config)
+        dialog.steering_slider.setValue(50)
+        dialog.rotation_slider.setValue(180)
+        dialog.suspension_slider.setValue(-50)
+        self.assertEqual(viewport.state, {"active": True, "steering": 0.5, "wheel_rotation": 180.0, "suspension": -0.5})
+        self.assertEqual(config, {"steering": {"max_angle": 40}, "suspension": {"travel": 0.3}})
+        dialog.close()
+        self.assertFalse(viewport.state["active"])
 
 
 if __name__ == "__main__":

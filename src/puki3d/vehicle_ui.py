@@ -6,28 +6,30 @@ import copy
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QPushButton, QTabWidget,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from .scene import node_matrix
 from .vehicle import (
     COMPONENTS, MOUNT_TYPES, ROLES, VEHICLE_TYPES, auto_classify,
-    create_mount_point, ensure_vehicle_system, set_node_classification,
+    axle_dimensions, create_mount_point, ensure_vehicle_system, set_node_classification,
     vehicle_diagnostics,
 )
 
 
 class VehicleSystemDialog(QDialog):
     def __init__(self, project_data: dict, nodes: list[dict], selected_node_id: str | None = None,
-                 parent: QWidget | None = None) -> None:
+                 selected_mount_id: str | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Sistema de vehículo")
-        self.resize(1000, 700)
+        self.resize(1180, 720)
         self.project_data = copy.deepcopy(project_data)
         self.nodes = copy.deepcopy(nodes)
         self.meta = ensure_vehicle_system(self.project_data, self.nodes)
         self.selected_node_id = selected_node_id
+        self.selected_mount_id = selected_mount_id
         root = QVBoxLayout(self)
         title = QLabel("Estructura funcional del vehículo")
         title.setObjectName("dialogTitle")
@@ -49,6 +51,14 @@ class VehicleSystemDialog(QDialog):
             self.chassis_field.addItem(node.get("name", "Objeto"), node.get("id"))
         self._set_combo_data(self.chassis_field, self.meta.get("chassis_node_id"))
         form.addRow("Referencia de chasis", self.chassis_field)
+        self.max_steering = self._number(float(self.meta["steering"].get("max_angle", 35.0)), 0.0, 80.0)
+        self.max_steering.setValue(float(self.meta["steering"].get("max_angle", 35.0)))
+        self.max_steering.setSuffix("°")
+        form.addRow("Ángulo máximo de dirección", self.max_steering)
+        self.suspension_travel = self._number(float(self.meta["suspension"].get("travel", 0.25)), 0.0, 2.0)
+        self.suspension_travel.setValue(float(self.meta["suspension"].get("travel", 0.25)))
+        self.suspension_travel.setSuffix(" m")
+        form.addRow("Recorrido de suspensión", self.suspension_travel)
         form.addRow(QLabel("Obligatorios: Body, Cabin, Chassis y cuatro Wheels."))
         form.addRow(QLabel("La referencia de chasis puede compartir la pieza con el componente Chassis."))
         tabs.addTab(summary, "Vehículo")
@@ -77,23 +87,26 @@ class VehicleSystemDialog(QDialog):
         wheels_tab = QWidget()
         wheels_layout = QVBoxLayout(wheels_tab)
         wheels_layout.addWidget(QLabel("Selecciona el rol wheel en Piezas para registrar un objeto como rueda."))
-        self.wheels_table = QTableWidget(0, 8)
-        self.wheels_table.setHorizontalHeaderLabels(["Rueda", "X", "Y", "Z", "Lado", "Eje", "Radio", "Ancho"])
-        self.wheels_table.setColumnWidth(0, 220)
-        for col in range(1, 8):
-            self.wheels_table.setColumnWidth(col, 86)
+        self.wheels_table = QTableWidget(0, 13)
+        self.wheels_table.setHorizontalHeaderLabels(["Rueda", "X", "Y", "Z", "Rot X", "Rot Y", "Rot Z", "Lado", "Eje", "Radio", "Ancho", "Dirige", "Motriz"])
+        self.wheels_table.setColumnWidth(0, 190)
+        for col in range(1, 13):
+            self.wheels_table.setColumnWidth(col, 72)
         self.wheels_table.setAlternatingRowColors(True)
         wheels_layout.addWidget(self.wheels_table, 1)
+        self.axle_metrics = QLabel()
+        wheels_layout.addWidget(self.axle_metrics)
         tabs.addTab(wheels_tab, "Ruedas")
 
         mounts_tab = QWidget()
         mounts_layout = QVBoxLayout(mounts_tab)
-        mounts_layout.addWidget(QLabel("Los puntos usan coordenadas del vehículo en metros. Los campos se pueden editar directamente."))
-        self.mounts_table = QTableWidget(0, 5)
-        self.mounts_table.setHorizontalHeaderLabels(["Nombre", "Tipo", "X", "Y", "Z"])
+        mounts_layout.addWidget(QLabel("Coordenadas en metros; al vincular una pieza pasan a ser locales a esa pieza."))
+        self.mounts_table = QTableWidget(0, 6)
+        self.mounts_table.setHorizontalHeaderLabels(["Nombre", "Tipo", "Pieza vinculada", "X", "Y", "Z"])
         self.mounts_table.setColumnWidth(0, 230)
-        self.mounts_table.setColumnWidth(1, 150)
-        for col in range(2, 5):
+        self.mounts_table.setColumnWidth(1, 125)
+        self.mounts_table.setColumnWidth(2, 230)
+        for col in range(3, 6):
             self.mounts_table.setColumnWidth(col, 110)
         self.mounts_table.itemChanged.connect(self._mount_name_changed)
         mounts_layout.addWidget(self.mounts_table, 1)
@@ -129,6 +142,8 @@ class VehicleSystemDialog(QDialog):
         self.name_field.textChanged.connect(lambda _value: self._update_diagnostics())
         self.type_field.currentTextChanged.connect(lambda _value: self._update_diagnostics())
         self.chassis_field.currentIndexChanged.connect(lambda _value: self._update_diagnostics())
+        self.max_steering.valueChanged.connect(lambda value: self._set_vehicle_measure("steering", "max_angle", value))
+        self.suspension_travel.valueChanged.connect(lambda value: self._set_vehicle_measure("suspension", "travel", value))
         self._update_diagnostics()
 
     def _set_combo(self, combo: QComboBox, value: str) -> None:
@@ -215,29 +230,54 @@ class VehicleSystemDialog(QDialog):
             info = node["vehicle"].setdefault("wheel", {})
             transform = node.setdefault("transform", {})
             transform.setdefault("position", [0.0, 0.0, 0.0])
+            transform.setdefault("rotation", [0.0, 0.0, 0.0])
             info["position"] = list(transform["position"])
+            info["rotation"] = list(transform["rotation"])
             for col, value in enumerate(info["position"], start=1):
                 spin = self._number(float(value))
                 spin.setValue(float(value))
                 spin.valueChanged.connect(lambda new_value, row=row, axis=col - 1: self._wheel_position_changed(row, axis, new_value))
                 self.wheels_table.setCellWidget(row, col, spin)
+            for col, value in enumerate(info["rotation"], start=4):
+                spin = self._number(float(value), -360.0, 360.0)
+                spin.setValue(float(value))
+                spin.setSuffix("°")
+                spin.valueChanged.connect(lambda new_value, row=row, axis=col - 4: self._wheel_rotation_changed(row, axis, new_value))
+                self.wheels_table.setCellWidget(row, col, spin)
             side = QComboBox()
             side.addItem("Izquierda", "left")
             side.addItem("Derecha", "right")
             self._set_combo_data(side, info.get("side", "left"))
-            side.currentIndexChanged.connect(lambda _value, row=row: self._wheel_field_changed(row, "side", self.wheels_table.cellWidget(row, 4).currentData()))
-            self.wheels_table.setCellWidget(row, 4, side)
+            side.currentIndexChanged.connect(lambda _value, row=row: self._wheel_field_changed(row, "side", self.wheels_table.cellWidget(row, 7).currentData()))
+            self.wheels_table.setCellWidget(row, 7, side)
             axle = QComboBox()
             axle.addItem("Delantero", "front")
             axle.addItem("Trasero", "rear")
             self._set_combo_data(axle, info.get("axle", "front"))
-            axle.currentIndexChanged.connect(lambda _value, row=row: self._wheel_field_changed(row, "axle", self.wheels_table.cellWidget(row, 5).currentData()))
-            self.wheels_table.setCellWidget(row, 5, axle)
-            for col, key in ((6, "radius"), (7, "width")):
+            axle.currentIndexChanged.connect(lambda _value, row=row: self._wheel_field_changed(row, "axle", self.wheels_table.cellWidget(row, 8).currentData()))
+            self.wheels_table.setCellWidget(row, 8, axle)
+            for col, key in ((9, "radius"), (10, "width")):
                 spin = self._number(float(info.get(key, 0.1)), 0.001, 1000.0)
                 spin.setValue(float(info.get(key, 0.1)))
                 spin.valueChanged.connect(lambda value, row=row, key=key: self._wheel_field_changed(row, key, value))
                 self.wheels_table.setCellWidget(row, col, spin)
+            for col, key in ((11, "steerable"), (12, "driven")):
+                check = QCheckBox()
+                check.setChecked(bool(info.get(key, False)))
+                check.setToolTip("Permite usar esta rueda en la dirección" if key == "steerable" else "Marca esta rueda como motriz")
+                check.stateChanged.connect(lambda state, row=row, key=key: self._wheel_field_changed(row, key, bool(state)))
+                self.wheels_table.setCellWidget(row, col, check)
+        dimensions = axle_dimensions(self.nodes)
+        self._update_axle_metrics(dimensions)
+
+    def _update_axle_metrics(self, dimensions: dict | None = None) -> None:
+        dimensions = dimensions or axle_dimensions(self.nodes)
+        fmt = lambda value: "—" if value is None else f"{value:.3f} m"
+        self.axle_metrics.setText(
+            f"Distancia entre ejes: {fmt(dimensions['wheelbase'])}  ·  "
+            f"Vía delantera: {fmt(dimensions['front_track'])}  ·  "
+            f"Vía trasera: {fmt(dimensions['rear_track'])}"
+        )
 
     def _wheel_node_for_row(self, row: int) -> dict | None:
         item = self.wheels_table.item(row, 0)
@@ -248,13 +288,28 @@ class VehicleSystemDialog(QDialog):
         if node:
             position = node.setdefault("transform", {}).setdefault("position", [0.0, 0.0, 0.0])
             position[axis] = value
-            node["vehicle"].setdefault("wheel", {})["position"] = list(position)
+            wheel = node["vehicle"].setdefault("wheel", {})
+            wheel["position"] = list(position)
+            wheel["rest_position"] = list(position)
+            self._update_axle_metrics()
+
+    def _wheel_rotation_changed(self, row: int, axis: int, value: float) -> None:
+        node = self._wheel_node_for_row(row)
+        if node:
+            rotation = node.setdefault("transform", {}).setdefault("rotation", [0.0, 0.0, 0.0])
+            rotation[axis] = value
+            node["vehicle"].setdefault("wheel", {})["rotation"] = list(rotation)
 
     def _wheel_field_changed(self, row: int, key: str, value) -> None:
         node = self._wheel_node_for_row(row)
         if node:
             node["vehicle"].setdefault("wheel", {})[key] = value
+            if key in {"side", "axle"}:
+                self._update_axle_metrics()
             self._update_diagnostics()
+
+    def _set_vehicle_measure(self, group: str, key: str, value: float) -> None:
+        self.meta.setdefault(group, {})[key] = value
 
     def _build_mounts_table(self) -> None:
         mounts = self.meta.setdefault("mount_points", [])
@@ -270,11 +325,20 @@ class VehicleSystemDialog(QDialog):
             kind.currentTextChanged.connect(lambda value, row=row: self._mount_field_changed(row, "type", value))
             self.mounts_table.setCellWidget(row, 1, kind)
             position = point.setdefault("position", [0.0, 0.0, 0.0])
-            for col, value in enumerate(position, start=2):
+            target = QComboBox()
+            target.addItem("Vehículo", None)
+            for node in self.nodes:
+                target.addItem(node.get("name", "Objeto"), node.get("id"))
+            self._set_combo_data(target, point.get("attached_node_id"))
+            target.currentIndexChanged.connect(lambda _value, row=row: self._mount_attachment_changed(row, self.mounts_table.cellWidget(row, 2).currentData()))
+            self.mounts_table.setCellWidget(row, 2, target)
+            for col, value in enumerate(position, start=3):
                 spin = self._number(float(value))
                 spin.setValue(float(value))
-                spin.valueChanged.connect(lambda new_value, row=row, axis=col - 2: self._mount_position_changed(row, axis, new_value))
+                spin.valueChanged.connect(lambda new_value, row=row, axis=col - 3: self._mount_position_changed(row, axis, new_value))
                 self.mounts_table.setCellWidget(row, col, spin)
+            if point.get("id") == self.selected_mount_id:
+                self.mounts_table.selectRow(row)
 
     def _mount_for_row(self, row: int) -> dict | None:
         if row < 0 or row >= len(self.meta.get("mount_points", [])):
@@ -293,6 +357,32 @@ class VehicleSystemDialog(QDialog):
         if point:
             point[key] = value
 
+    def _mount_attachment_changed(self, row: int, node_id: str | None) -> None:
+        point = self._mount_for_row(row)
+        if not point:
+            return
+        world = point.setdefault("position", [0.0, 0.0, 0.0])
+        old_id = point.get("attached_node_id")
+        old_node = self._node_by_id(old_id) if old_id else None
+        if old_node:
+            import numpy as np
+            world = (node_matrix(old_node) @ np.append(world, 1.0))[:3]
+        if node_id:
+            target = self._node_by_id(node_id)
+            if target:
+                import numpy as np
+                local = (np.linalg.inv(node_matrix(target)) @ np.append(world, 1.0))[:3]
+                point["position"] = local.tolist()
+        else:
+            point["position"] = list(world)
+        point["attached_node_id"] = node_id
+        for axis, value in enumerate(point["position"]):
+            spin = self.mounts_table.cellWidget(row, axis + 3)
+            if spin:
+                spin.blockSignals(True)
+                spin.setValue(float(value))
+                spin.blockSignals(False)
+
     def _mount_position_changed(self, row: int, axis: int, value: float) -> None:
         point = self._mount_for_row(row)
         if point:
@@ -302,7 +392,7 @@ class VehicleSystemDialog(QDialog):
         selected = self._node_by_id(self.selected_node_id) if self.selected_node_id else None
         point = create_mount_point(self.meta["mount_points"])
         if selected:
-            point["position"] = list(selected.get("transform", {}).get("position", [0.0, 0.0, 0.0]))
+            point["attached_node_id"] = selected.get("id")
         self.meta["mount_points"].append(point)
         self._build_mounts_table()
         self.mounts_table.selectRow(self.mounts_table.rowCount() - 1)

@@ -40,6 +40,7 @@ from .project import PROJECT_EXTENSION, PROJECT_TYPES, Project, ProjectError
 from .scene import MeshTopologyError, PRIMITIVES, create_node, ensure_editable_geometry, node_matrix, node_display_color
 from .viewport import SceneViewport
 from .vehicle_ui import VehicleSystemDialog
+from .vehicle_preview import VehiclePreviewDialog
 
 
 BACKGROUND = "#101114"
@@ -140,6 +141,10 @@ class MainWindow(QMainWindow):
         project_menu.addSeparator()
         project_menu.addAction(vehicle_action)
         self.vehicle_action = vehicle_action
+        preview_action = QAction("Vehicle Preview…", self)
+        preview_action.triggered.connect(self.open_vehicle_preview)
+        project_menu.addAction(preview_action)
+        self.vehicle_preview_action = preview_action
         project_menu.addSeparator()
         close_action = QAction("Cerrar proyecto", self)
         close_action.setShortcut("Ctrl+W")
@@ -469,6 +474,11 @@ class MainWindow(QMainWindow):
         self.viewport.modeChanged.connect(self._on_viewport_mode_changed)
         self.viewport.extrusionStateChanged.connect(self._on_extrusion_state_changed)
         self.viewport.insetStateChanged.connect(self._on_inset_state_changed)
+        self.locators_button = QPushButton("Locators")
+        self.locators_button.setCheckable(True)
+        self.locators_button.setChecked(True)
+        self.locators_button.toggled.connect(self.viewport.set_locators_visible)
+        canvas_toolbar.insertWidget(canvas_toolbar.count() - 1, self.locators_button)
         canvas_layout.addWidget(self.viewport, 1)
         status = QHBoxLayout()
         status_label = QLabel("ESCENA PRINCIPAL")
@@ -1087,6 +1097,7 @@ class MainWindow(QMainWindow):
         self.save_state.setText("●  Guardado")
         self.setWindowTitle(f"{project.name} — Puki3D")
         self._refresh_outliner(None)
+        self.viewport.set_vehicle_system(project.data.get("vehicle_system"))
         self._update_transform_fields(None)
         self._set_project_actions(True)
         self.stack.setCurrentWidget(self.workspace)
@@ -1108,11 +1119,13 @@ class MainWindow(QMainWindow):
             return
         nodes = self._active_scene_nodes()
         selected_id = self.viewport.selected_id
-        dialog = VehicleSystemDialog(self.project.data, nodes, selected_id, self)
+        dialog = VehicleSystemDialog(self.project.data, nodes, selected_id, self.viewport.selected_locator_id, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.project.data["vehicle_system"] = copy.deepcopy(dialog.project_data["vehicle_system"])
         self.project.data["project"]["type"] = "vehicle"
+        self.viewport.set_vehicle_system(self.project.data["vehicle_system"])
+        self.locators_button.setChecked(True)
         edited_nodes = {node.get("id"): node for node in dialog.nodes}
         for node in nodes:
             edited = edited_nodes.get(node.get("id"))
@@ -1120,11 +1133,30 @@ class MainWindow(QMainWindow):
                 node["vehicle"] = copy.deepcopy(edited.get("vehicle", {}))
                 if edited.get("transform", {}).get("position") != node.get("transform", {}).get("position"):
                     node.setdefault("transform", {})["position"] = list(edited["transform"]["position"])
+                if edited.get("transform", {}).get("rotation") != node.get("transform", {}).get("rotation"):
+                    node.setdefault("transform", {})["rotation"] = list(edited["transform"]["rotation"])
         if self.viewport.selected_node:
             self._update_transform_fields(self.viewport.selected_node)
         self.viewport.update()
         self.project_type.setText(PROJECT_TYPES[self.project.kind])
         self._mark_project_dirty()
+
+    def open_vehicle_preview(self) -> None:
+        if not self.project:
+            return
+        if not self.project.data.get("vehicle_system"):
+            self.open_vehicle_system()
+            if not self.project.data.get("vehicle_system"):
+                return
+        if getattr(self, "_vehicle_preview_dialog", None):
+            self._vehicle_preview_dialog.raise_()
+            self._vehicle_preview_dialog.activateWindow()
+            return
+        self._vehicle_preview_dialog = VehiclePreviewDialog(
+            self.viewport, self.project.data["vehicle_system"], self
+        )
+        self._vehicle_preview_dialog.destroyed.connect(lambda: setattr(self, "_vehicle_preview_dialog", None))
+        self._vehicle_preview_dialog.show()
 
     def rename_project(self) -> None:
         if not self.project:
