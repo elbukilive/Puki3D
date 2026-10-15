@@ -43,6 +43,7 @@ from .vehicle_ui import VehicleSystemDialog
 from .vehicle_preview import VehiclePreviewDialog
 from .materials import MaterialEditorDialog, ensure_material_library
 from .uv_editor import UVEditorDialog
+from .ats_config import ATSConfigDialog
 
 
 BACKGROUND = "#101114"
@@ -144,6 +145,10 @@ class MainWindow(QMainWindow):
         project_menu.addSeparator()
         project_menu.addAction(vehicle_action)
         self.vehicle_action = vehicle_action
+        ats_action = QAction("ATS Config y validador...", self)
+        ats_action.triggered.connect(self.open_ats_config)
+        project_menu.addAction(ats_action)
+        self.ats_config_action = ats_action
         preview_action = QAction("Vehicle Preview…", self)
         preview_action.triggered.connect(self.open_vehicle_preview)
         project_menu.addAction(preview_action)
@@ -1263,6 +1268,15 @@ class MainWindow(QMainWindow):
             self._update_transform_fields(self.viewport.selected_node)
         self.viewport.update()
         self.project_type.setText(PROJECT_TYPES[self.project.kind])
+        self._mark_project_dirty()
+
+    def open_ats_config(self) -> None:
+        if not self.project:
+            return
+        dialog = ATSConfigDialog(self.project.data, self._active_scene_nodes(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.project.data["ats_config"] = copy.deepcopy(dialog.project_data["ats_config"])
         self._mark_project_dirty()
 
     def open_vehicle_preview(self) -> None:
